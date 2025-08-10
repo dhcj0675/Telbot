@@ -3,9 +3,9 @@
 // Vars (Workers → Settings → Variables):
 //   BOT_TOKEN (Secret), WH_SECRET (Var or in wrangler.toml), optional TG_SECRET_TOKEN (Secret)
 
-// ========= Admin config =========
-// ایدی تلگرام ادمین‌ها را اینجا بگذار (ادمین باید اول یکبار به بات پیام بده تا بشود به او پیام داد)
-const ADMINS = [ /* مثلا: 123456789 */ ];
+// ========= Admins =========
+// ⬇️ آی‌دی عددی ادمین‌ها را اینجا بگذارید. ادمین باید یک‌بار به بات پیام بدهد.
+const ADMINS = [6803856798];
 
 const tg = async (env, method, payload) => {
   const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
@@ -25,7 +25,7 @@ const send = (env, chat_id, text, extra = {}) =>
 const answerCallback = (env, callback_query_id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id, text, show_alert });
 
-// ========= Reply Keyboard labels =========
+// ========= Labels (Reply Keyboard) =========
 const KB = {
   home: "🏠 خانه",
   help: "ℹ️ راهنما",
@@ -36,7 +36,6 @@ const KB = {
   whoami: "🆔 من کیم؟",
   contact: "📩 پیام به ادمین"
 };
-
 const REPLY_KB = {
   keyboard: [
     [{ text: KB.home }, { text: KB.help }],
@@ -50,9 +49,7 @@ const REPLY_KB = {
   input_field_placeholder: "از دکمه‌های پایین انتخاب کن…"
 };
 
-const REMOVE_KB = { remove_keyboard: true };
-
-// تشخیص /command (برای سازگاری در گروه‌ها)
+// Utility: parse /command (for group compatibility)
 function parseCommand(text = "", botUsername = "") {
   if (!text || !text.startsWith("/")) return { cmd: null, args: [] };
   const [first, ...rest] = text.trim().split(/\s+/);
@@ -61,17 +58,14 @@ function parseCommand(text = "", botUsername = "") {
   return { cmd: raw.slice(1).toLowerCase(), args: rest };
 }
 
-// ارسال به همه‌ی ادمین‌ها
-async function notifyAdmins(env, from, text) {
+// Forward message to all admins with context tag
+async function notifyAdmins(env, from, text, tag = "") {
   if (!ADMINS.length) return;
   const who = `${from.first_name || ""} ${from.last_name || ""}`.trim() || "کاربر";
-  const header = `📥 پیام جدید از ${who}\nID: ${from.id}\n\n`;
+  const header = `📥 پیام جدید ${tag ? `(${tag}) ` : ""}از ${who}\nID: ${from.id}\n\n`;
   for (const adminId of ADMINS) {
-    try {
-      await send(env, adminId, header + text);
-    } catch (e) {
-      console.error("notify admin failed:", adminId, e);
-    }
+    try { await send(env, adminId, header + text); }
+    catch(e) { console.error("notify admin failed:", adminId, e); }
   }
 }
 
@@ -86,13 +80,13 @@ export default {
 
     // Webhook
     if (request.method === "POST" && url.pathname === `/webhook/${env.WH_SECRET}`) {
-      // Optional: Telegram secret header
-      const hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+      // Optional Telegram secret header
+      const hdr = request.headers.get("X-TeleGRAM-BOT-API-SECRET-TOKEN") || request.headers.get("X-Telegram-Bot-Api-Secret-Token");
       if (env.TG_SECRET_TOKEN && hdr !== env.TG_SECRET_TOKEN) return new Response("forbidden", { status: 403 });
 
       let update; try { update = await request.json(); } catch { update = null; }
 
-      // ===== Inline callbacks (products submenu) =====
+      // ===== Inline callbacks (Products submenu) =====
       if (update?.callback_query) {
         const cq = update.callback_query;
         const chatId = cq.message?.chat?.id;
@@ -100,10 +94,20 @@ export default {
 
         if (data === "prod_1") {
           await send(env, chatId, "🧃 محصول ۱ — قیمت: 100,000 تومان ✅", { reply_markup: REPLY_KB });
+          // Ask for message to admin about product 1
+          await send(env, chatId, "سوالی درباره «محصول ۱» داری؟ پاسخ بده تا برای ادمین ارسال شه. ##ADMIN:prod1##", {
+            reply_markup: { force_reply: true, selective: true }
+          });
         } else if (data === "prod_2") {
           await send(env, chatId, "🍫 محصول ۲ — قیمت: 175,000 تومان ✅", { reply_markup: REPLY_KB });
+          await send(env, chatId, "سوالی درباره «محصول ۲» داری؟ پاسخ بده تا برای ادمین ارسال شه. ##ADMIN:prod2##", {
+            reply_markup: { force_reply: true, selective: true }
+          });
         } else if (data === "prod_3") {
           await send(env, chatId, "🎁 محصول ۳ — قیمت: 450,000 تومان ✅", { reply_markup: REPLY_KB });
+          await send(env, chatId, "سوالی درباره «محصول ۳» داری؟ پاسخ بده تا برای ادمین ارسال شه. ##ADMIN:prod3##", {
+            reply_markup: { force_reply: true, selective: true }
+          });
         } else if (data === "back_home") {
           await send(env, chatId, "به خانه برگشتی 🏠", { reply_markup: REPLY_KB });
         } else {
@@ -116,14 +120,19 @@ export default {
       // ===== Normal messages =====
       const msg = update && (update.message || update.edited_message);
       if (!msg) return new Response("ok");
+
       const chatId = msg.chat.id;
       const from = msg.from || {};
       const text = msg.text || "";
 
-      // ForceReply detection for admin message
-      if (msg.reply_to_message?.text?.includes("##ADMIN##")) {
+      // If user replied to a ForceReply we sent, forward to admins with tag
+      const repliedText = msg.reply_to_message?.text || "";
+      if (repliedText && (repliedText.includes("##ADMIN##") || repliedText.includes("##ADMIN:"))) {
+        let tag = "contact";
+        const m = repliedText.match(/##ADMIN:([a-z0-9_]+)##?/i);
+        if (m) tag = m[1];
         if (text.trim()) {
-          await notifyAdmins(env, from, text.trim());
+          await notifyAdmins(env, from, text.trim(), tag);
           await send(env, chatId, "پیام‌ت برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
         } else {
           await send(env, chatId, "متن خالیه. دوباره بنویس.", { reply_markup: REPLY_KB });
@@ -136,15 +145,26 @@ export default {
       try { me = await tg(env, "getMe", {}); } catch {}
       const { cmd, args } = parseCommand(text, me.result.username);
 
-      // ===== Router (Reply Keyboard first) =====
+      // ===== Labels (Reply Keyboard) =====
+      const KB = {
+        home: "🏠 خانه",
+        help: "ℹ️ راهنما",
+        products: "🛒 محصولات",
+        account: "👤 حساب",
+        ping: "🏓 پینگ",
+        time: "⏰ زمان",
+        whoami: "🆔 من کیم؟",
+        contact: "📩 پیام به ادمین"
+      };
+
       if (text === KB.home || cmd === "start") {
         await send(env, chatId, "سلام! ✅ همه گزینه‌ها در کیبورد پایین هست.", { reply_markup: REPLY_KB });
 
       } else if (text === KB.help || cmd === "help") {
         await send(env, chatId,
           "راهنما:\n" +
-          "• " + KB.products + " — دیدن محصولات\n" +
-          "• " + KB.contact + " — ارسال پیام به ادمین (ForceReply)\n" +
+          "• " + KB.products + " — دیدن محصولات و پرسیدن سؤال\n" +
+          "• " + KB.contact + " — ارسال پیام آزاد به ادمین\n" +
           "• " + KB.account + " — نمایش حساب شما\n" +
           "• " + KB.ping + " — تست زنده بودن\n" +
           "• " + KB.time + " — زمان فعلی UTC\n" +
@@ -167,6 +187,12 @@ export default {
           }
         });
 
+      } else if (text === KB.contact) {
+        // Free message to admins via ForceReply
+        await send(env, chatId, "##ADMIN## لطفاً پیام خود را برای ادمین به‌صورت «پاسخ به همین پیام» ارسال کنید.", {
+          reply_markup: { force_reply: true, selective: true }
+        });
+
       } else if (text === KB.account || cmd === "whoami") {
         await send(env, chatId, `👤 حساب شما:\nID: ${from.id}\nنام: ${(from.first_name||"") + " " + (from.last_name||"")}`.trim(), { reply_markup: REPLY_KB });
 
@@ -178,12 +204,6 @@ export default {
 
       } else if (text === KB.whoami) {
         await send(env, chatId, `ID: ${from.id}`, { reply_markup: REPLY_KB });
-
-      } else if (text === KB.contact) {
-        // Ask for a message using ForceReply (no state/KV needed)
-        await send(env, chatId, "##ADMIN## لطفاً پیام خود را برای ادمین به‌صورت «پاسخ به همین پیام» ارسال کنید.", {
-          reply_markup: { force_reply: true, selective: true }
-        });
 
       } else if (cmd === "echo") {
         await send(env, chatId, args.length ? args.join(" ") : "چیزی برای echo ندادید.", { reply_markup: REPLY_KB });

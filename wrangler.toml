@@ -1,0 +1,6 @@
+name = "tg-bot-telbot"
+main = "worker.js"
+compatibility_date = "2024-10-01"
+
+[vars]
+WH_SECRET = "secret123"

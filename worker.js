@@ -174,11 +174,12 @@ async function handleUpdate(update, env) {
     // callbacks
     if (update?.callback_query) {
       const cq = update.callback_query;
+      const userId = cq.from?.id || cq.message?.chat?.id; // ← اصلاح: تشخیص ادمین بر اساس from.id
       const chatId = cq.message?.chat?.id;
       const data = cq.data || "";
-      const kb = isAdmin(chatId) ? REPLY_KB_ADMIN : REPLY_KB_USER;
+      const kb = isAdmin(userId) ? REPLY_KB_ADMIN : REPLY_KB_USER;
 
-      if (!isAdmin(chatId) && (data === "csv_users" || data === "csv_phones")) {
+      if (!isAdmin(userId) && (data === "csv_users" || data === "csv_phones")) {
         await answerCallback(env, cq.id, "فقط ادمین.", true); return;
       }
       if (data === "csv_users") {
@@ -189,7 +190,7 @@ async function handleUpdate(update, env) {
         await send(env, chatId, "محصول ۱ — قیمت: 100,000 تومان", { reply_markup: kb });
         await send(env, chatId, "##ADMIN:prod1## اگر سوالی داری همین پیام را Reply کن.");
       } else if (data === "prod_2") {
-        await send(env, chatId, "محصول ₂ — قیمت: 175,000 تومان", { reply_markup: kb });
+        await send(env, chatId, "محصول 2 — قیمت: 175,000 تومان", { reply_markup: kb });
         await send(env, chatId, "##ADMIN:prod2## اگر سوالی داری همین پیام را Reply کن.");
       } else if (data === "prod_3") {
         await send(env, chatId, "محصول ۳ — قیمت: 450,000 تومان", { reply_markup: kb });

@@ -1,18 +1,29 @@
+# wrangler.toml — تلگرام‌بات Cloudflare Workers
+
 name = "telbottest"
 main = "worker.js"
 compatibility_date = "2024-10-01"
 workers_dev = true
+
+# اکانت کلودفلر
 account_id = "e4ebd6d4925fe9c43dca494a9a0fe835"
 
+# اتصال KV به متغیر "KV" (هم‌نام با کد)
 [[kv_namespaces]]
 binding = "KV"
 id = "261ee020d94442a9be799a7bba9a3d9b"
 
+# متغیرهای غیرسکرت که می‌خوای با دیپلوی از بین نرن
+[vars]
+WH_SECRET = "dhcj0675121971"
+ADMIN_EXPORT_SECRET = "Don_4420471219719510"
+
+# (اختیاری) اگر از محیط Preview هم استفاده می‌کنی:
 [env.preview]
 [[env.preview.kv_namespaces]]
 binding = "KV"
 id = "261ee020d94442a9be799a7bba9a3d9b"
 
-[vars]
+[env.preview.vars]
 WH_SECRET = "dhcj0675121971"
 ADMIN_EXPORT_SECRET = "Don_4420471219719510"

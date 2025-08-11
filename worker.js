@@ -3,9 +3,9 @@
 const ADMINS = [6803856798]; // آیدی عددی ادمین‌ها
 
 // --- Anti-flood ---
-const RATE_LIMIT = 4;   // 4 پیام
+const RATE_LIMIT = 8;   // 4 پیام
 const WINDOW_TTL = 10;  // در 10 ثانیه
-const BLOCK_TTL  = 60;  // بلاک 60 ثانیه
+const BLOCK_TTL  = 10;  // بلاک 60 ثانیه
 
 // --- Labels ---
 const KB = {

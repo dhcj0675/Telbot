@@ -1,6 +1,11 @@
-// worker.js — KV + Stats + CSV + Persian labels + Silent confirmations + logging
-const ADMINS = [6803856798];
+// worker.js — KV + Stats + CSV + Persian labels + Silent confirmations + Anti-flood
+const ADMINS = [6803856798]; // ادمین‌ها (نامحدود)
 
+const RATE_LIMIT = 4;       // 4 پیام
+const WINDOW_TTL = 10;      // در 10 ثانیه
+const BLOCK_TTL  = 60;      // بلاک 1 دقیقه
+
+// ---------- Telegram helpers ----------
 const tg = async (env, method, payload) => {
   const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
@@ -34,7 +39,7 @@ async function sendCSVDocument(env, chat_id, filename, csvText, caption = "") {
 }
 const isAdmin = (id) => ADMINS.includes(id);
 
-// Labels
+// ---------- Labels ----------
 const KB = {
   home: "خانه",
   help: "راهنما",
@@ -69,7 +74,7 @@ const REPLY_KB_ADMIN = {
   input_field_placeholder: "منوی ادمین"
 };
 
-// KV helpers
+// ---------- KV helpers ----------
 async function trackUserOnce(env, from) {
   if (!env.KV) return { isNew: false };
   const key = `user:${from.id}`;
@@ -92,9 +97,7 @@ async function getLastUsers(env, limit=10){
   const l = await listUserKeys(env);
   const vals = await Promise.all(l.keys.map(k=>env.KV.get(k.name)));
   return vals.map(v=>{try{return JSON.parse(v||"{}")}catch{return null}})
-             .filter(Boolean)
-             .sort((a,b)=>(b.ts||0)-(a.ts||0))
-             .slice(0,limit);
+             .filter(Boolean).sort((a,b)=>(b.ts||0)-(a.ts||0)).slice(0,limit);
 }
 async function buildUsersCSV(env){
   const l = await listUserKeys(env);
@@ -117,6 +120,35 @@ async function buildPhonesCSV(env){
   return rows.map(r=>r.map(x=>`"${String(x).replace(/"/g,'""')}"`).join(",")).join("\n");
 }
 
+// ---------- Anti-flood with KV (per user) ----------
+async function rateLimitExceeded(env, userId) {
+  if (!env.KV) return false;     // اگر KV وصل نیست، ریت‌لیمیت را بی‌اثر کن
+  if (isAdmin(userId)) return false;
+
+  const blockKey = `rl:b:${userId}`;
+  const countKey = `rl:c:${userId}`;
+
+  // اگر در بلاک است
+  if (await env.KV.get(blockKey)) return true;
+
+  // شمارنده فعلی
+  const raw = await env.KV.get(countKey);
+  const count = raw ? parseInt(raw, 10) : 0;
+
+  // اگر این پیام از سقف عبور دهد → بلاک 1 دقیقه
+  if (count + 1 > RATE_LIMIT) {
+    await env.KV.put(blockKey, "1", { expirationTtl: BLOCK_TTL });
+    // شمارنده را به حال خودش می‌گذاریم تا خودکار در 10s منقضی شود
+    console.log(`flood: user ${userId} blocked for ${BLOCK_TTL}s`);
+    return true;
+  }
+
+  // افزایش شمارنده + ریست TTL پنجره (sliding window)
+  await env.KV.put(countKey, String(count + 1), { expirationTtl: WINDOW_TTL });
+  return false;
+}
+
+// ---------- Admin notify ----------
 async function notifyAdmins(env, from, text, tag=""){
   if (!ADMINS.length) return;
   const who = `${from.first_name||""} ${from.last_name||""}`.trim() || "کاربر";
@@ -137,7 +169,7 @@ function parseCommand(text="", botUsername=""){
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    console.log("REQ", request.method, url.pathname); // <-- لاگ ورودی
+    console.log("REQ", request.method, url.pathname);
 
     // Health
     if (request.method==="GET" && url.pathname==="/") {
@@ -165,6 +197,16 @@ export default {
       if (env.TG_SECRET_TOKEN && hdr !== env.TG_SECRET_TOKEN) return new Response("forbidden", {status:403});
 
       let update; try{ update = await request.json(); }catch{ update = null; }
+
+      // استخراج شناسه کاربر برای ریت‌لیمیت
+      const actorId = update?.message?.from?.id
+                   || update?.edited_message?.from?.id
+                   || update?.callback_query?.from?.id
+                   || null;
+      if (actorId && await rateLimitExceeded(env, actorId)) {
+        // سایلنت: هیچ پیامی به کاربر نده، فقط 200 OK
+        return new Response("ok");
+      }
 
       // Callbacks (CSV + back + products)
       if (update?.callback_query){

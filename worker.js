@@ -1,10 +1,11 @@
-// worker.js — Telegram bot on Cloudflare Workers (KV + last 10 users + CSV export)
-// Vars (Workers → Settings → Variables):
-//   BOT_TOKEN (Secret), WH_SECRET (Var), optional TG_SECRET_TOKEN (Secret), optional ADMIN_EXPORT_SECRET (Var)
-// Bindings (Workers → Settings → Bindings):
+// worker.js — Telegram bot on Cloudflare Workers
+// KV + Stats + CSV in Telegram + Custom Persian labels + Silent confirmations
+// Vars (Settings → Variables):
+//   BOT_TOKEN (Secret), WH_SECRET (Text), optional TG_SECRET_TOKEN (Secret), optional ADMIN_EXPORT_SECRET (Text)
+// Bindings (Settings → Bindings):
 //   KV  → KV Namespace  (Variable name must be exactly "KV")
 
-const ADMINS = [6803856798]; // ← آیدی عددی ادمین‌ها
+const ADMINS = [6803856798]; // ID عددی ادمین‌ها
 
 // ---------- Telegram helpers ----------
 const tg = async (env, method, payload) => {
@@ -22,24 +23,43 @@ const tg = async (env, method, payload) => {
 };
 const send = (env, chat_id, text, extra = {}) =>
   tg(env, "sendMessage", { chat_id, text, ...extra });
-const answerCallback = (env, callback_query_id, text = "", show_alert = false) =>
-  tg(env, "answerCallbackQuery", { callback_query_id, text, show_alert });
+const answerCallback = (env, id, text = "", show_alert = false) =>
+  tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
+
+// ارسال فایل CSV مستقیم داخل تلگرام
+async function sendCSVDocument(env, chat_id, filename, csvText, caption = "") {
+  const fd = new FormData();
+  fd.append("chat_id", String(chat_id));
+  fd.append("document", new Blob([csvText], { type: "text/csv; charset=utf-8" }), filename);
+  if (caption) fd.append("caption", caption);
+  const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendDocument`, {
+    method: "POST",
+    body: fd
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    console.error("sendDocument error:", res.status, body);
+    throw new Error(`sendDocument ${res.status}`);
+  }
+  return res.json();
+}
 
 const isAdmin = (id) => ADMINS.includes(id);
 
-// ---------- Reply Keyboard ----------
+// ---------- Reply Keyboard (Custom Persian labels) ----------
 const KB = {
-  home: "🏠 خانه",
-  help: "ℹ️ راهنما",
-  products: "🛒 محصولات",
-  account: "👤 حساب",
-  ping: "🏓 پینگ",
-  time: "⏰ زمان",
-  whoami: "🆔 من کیم؟",
-  contact: "📩 پیام به ادمین",
-  sharePhone: "📞 ارسال شماره من",
-  stats: "📊 آمار"
+  home: "خانه",
+  help: "راهنما",
+  products: "محصولات",
+  account: "حساب",
+  contact: "پیام به ادمین",
+  ping: "پینگ",
+  time: "زمان",
+  whoami: "من کیم",
+  sharePhone: "ارسال شماره من",
+  stats: "آمار (ادمین)"
 };
+
 const REPLY_KB_USER = {
   keyboard: [
     [{ text: KB.home }, { text: KB.help }],
@@ -81,25 +101,20 @@ async function trackUserOnce(env, from) {
   return { isNew: false };
 }
 const savePhone = (env, id, phone) => env.KV?.put(`phone:${id}`, phone);
-const listUserKeys = (env) => env.KV.list({ prefix: "user:" });
+const listUserKeys  = (env) => env.KV.list({ prefix: "user:" });
 const listPhoneKeys = (env) => env.KV.list({ prefix: "phone:" });
-const getUserCount = async (env) => (await listUserKeys(env)).keys.length;
-const getPhonesCount = async (env) => (await listPhoneKeys(env)).keys.length;
+const getUserCount  = async (env) => (await listUserKeys(env)).keys.length;
+const getPhonesCount= async (env) => (await listPhoneKeys(env)).keys.length;
 
 async function getLastUsers(env, limit = 10) {
   const l = await listUserKeys(env);
-  // Fetch values, parse, sort by ts desc
-  const vals = await Promise.all(
-    l.keys.map(k => env.KV.get(k.name))
-  );
-  const users = vals
+  const vals = await Promise.all(l.keys.map(k => env.KV.get(k.name)));
+  return vals
     .map(v => { try { return JSON.parse(v || "{}"); } catch { return null; } })
     .filter(Boolean)
     .sort((a,b) => (b.ts||0) - (a.ts||0))
     .slice(0, limit);
-  return users;
 }
-
 async function buildUsersCSV(env) {
   const l = await listUserKeys(env);
   const vals = await Promise.all(l.keys.map(k => env.KV.get(k.name)));
@@ -171,7 +186,7 @@ export default {
       return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
     }
 
-    // --- CSV export endpoints (admin-only via secret) ---
+    // (اختیاری) لینک دانلود CSV با secret
     if (request.method === "GET" && url.pathname === "/export/users.csv") {
       if (!env.KV) return new Response("KV not configured", { status: 500 });
       if (!exportSecret || url.searchParams.get("secret") !== exportSecret) return new Response("forbidden", { status: 403 });
@@ -195,22 +210,47 @@ export default {
       });
     }
 
-    // Webhook
+    // Webhook (dynamic secret via env.WH_SECRET)
     if (request.method === "POST" && url.pathname === `/webhook/${env.WH_SECRET}`) {
-      const hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || request.headers.get("X-Telegram-BOT-API-SECRET-TOKEN");
-      if (env.TG_SECRET_TOKEN && hdr !== env.TG_SECRET_TOKEN) return new Response("forbidden", { status: 403 });
+      const hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+              || request.headers.get("X-Telegram-BOT-API-SECRET-TOKEN");
+      if (env.TG_SECRET_TOKEN && hdr !== env.TG_SECRET_TOKEN) {
+        return new Response("forbidden", { status: 403 });
+      }
 
       let update; try { update = await request.json(); } catch { update = null; }
 
-      // Inline callbacks (نمونه)
+      // Inline callbacks (CSV, Products, Back)
       if (update?.callback_query) {
         const cq = update.callback_query;
         const chatId = cq.message?.chat?.id;
         const data = cq.data || "";
-        if (data === "back_home") {
-          await send(env, chatId, "به خانه برگشتی 🏠", { reply_markup: isAdmin(chatId) ? REPLY_KB_ADMIN : REPLY_KB_USER });
+        const keyboard = isAdmin(chatId) ? REPLY_KB_ADMIN : REPLY_KB_USER;
+
+        if (!isAdmin(chatId) && (data === "csv_users" || data === "csv_phones")) {
+          await answerCallback(env, cq.id, "فقط ادمین.", true);
+          return new Response("ok");
+        }
+
+        if (data === "csv_users") {
+          const csv = await buildUsersCSV(env);
+          await sendCSVDocument(env, chatId, "users.csv", csv, "📄 CSV کاربران");
+        } else if (data === "csv_phones") {
+          const csv = await buildPhonesCSV(env);
+          await sendCSVDocument(env, chatId, "phones.csv", csv, "📄 CSV شماره‌ها");
+        } else if (data === "prod_1") {
+          await send(env, chatId, "محصول ۱ — قیمت: 100,000 تومان", { reply_markup: keyboard });
+          await send(env, chatId, "##ADMIN:prod1## اگر سوالی داری همین پیام را Reply کن.");
+        } else if (data === "prod_2") {
+          await send(env, chatId, "محصول ۲ — قیمت: 175,000 تومان", { reply_markup: keyboard });
+          await send(env, chatId, "##ADMIN:prod2## اگر سوالی داری همین پیام را Reply کن.");
+        } else if (data === "prod_3") {
+          await send(env, chatId, "محصول ۳ — قیمت: 450,000 تومان", { reply_markup: keyboard });
+          await send(env, chatId, "##ADMIN:prod3## اگر سوالی داری همین پیام را Reply کن.");
+        } else if (data === "back_home") {
+          await send(env, chatId, "به خانه برگشتی", { reply_markup: keyboard });
         } else {
-          await send(env, chatId, `داده‌ی دکمه: ${data}`, { reply_markup: isAdmin(chatId) ? REPLY_KB_ADMIN : REPLY_KB_USER });
+          await send(env, chatId, `داده‌ی دکمه: ${data}`, { reply_markup: keyboard });
         }
         await answerCallback(env, cq.id);
         return new Response("ok");
@@ -225,11 +265,11 @@ export default {
       const text = msg.text || "";
       const keyboard = isAdmin(chatId) ? REPLY_KB_ADMIN : REPLY_KB_USER;
 
-      // Contact share → save + notify
+      // Contact share → save + notify (SILENT to user)
       if (msg.contact && msg.contact.user_id === from.id) {
         const phone = msg.contact.phone_number;
         await savePhone(env, from.id, phone);
-        await send(env, chatId, "شماره‌ت دریافت شد ✅", { reply_markup: keyboard });
+        // هیچ پیام تأییدی به کاربر نشان نمی‌دهیم
         await notifyAdmins(env, from, `شماره کاربر: ${phone}`, "phone");
         return new Response("ok");
       }
@@ -239,38 +279,37 @@ export default {
       try { me = await tg(env, "getMe", {}); } catch {}
       const { cmd, args } = parseCommand(text, me.result.username);
 
-      // FIRST /start → welcome + notify admin once
+      // FIRST /start → welcome + notify admin once (SILENT to user about admin notify)
       if (cmd === "start") {
         const { isNew } = await trackUserOnce(env, from);
         await send(env, chatId,
-          "سلام! ✅ همه گزینه‌ها در کیبورد پایین هست. برای ارسال شماره، «📞 ارسال شماره من» را بزن.",
+          "سلام! به بات خوش آمدید. از دکمه‌های پایین استفاده کنید.",
           { reply_markup: keyboard }
         );
         if (isNew) await notifyAdmins(env, from, "اولین بار ربات را استارت کرد.", "new_user");
         return new Response("ok");
       }
 
-      // ForceReply reply to admin prompt
+      // ForceReply reply to admin prompt (SILENT confirmation)
       const repliedText = msg.reply_to_message?.text || "";
-      if (repliedText && repliedText.includes("##ADMIN##")) {
-        if (text.trim()) {
+      if (repliedText && (repliedText.includes("##ADMIN##") || repliedText.includes("##ADMIN:"))) {
+        if (text && text.trim()) {
           await notifyAdmins(env, from, text.trim(), "contact");
-          await send(env, chatId, "پیام‌ت برای ادمین ارسال شد ✅", { reply_markup: keyboard });
-        } else {
-          await send(env, chatId, "متن خالیه. دوباره بنویس.", { reply_markup: keyboard });
+          // هیچ پیام تأییدی به کاربر نمی‌دهیم
         }
         return new Response("ok");
       }
 
-      // Router
+      // Router (labels in Persian)
       if (text === KB.home) {
-        await send(env, chatId, "به خانه خوش اومدی 🏠", { reply_markup: keyboard });
+        await send(env, chatId, "بازگشت به صفحه‌ی اول بات.", { reply_markup: keyboard });
 
       } else if (text === KB.help || cmd === "help") {
         await send(env, chatId,
           "راهنما:\n" +
-          "• " + KB.sharePhone + " — با رضایت شما، شماره‌تان ثبت و برای ادمین ارسال می‌شود\n" +
-          "• " + KB.contact + " — ارسال پیام آزاد به ادمین (Reply کنید)\n" +
+          "• " + KB.products + " — دیدن محصولات و پرسیدن سؤال\n" +
+          "• " + KB.contact + " — ارسال پیام به ادمین (Reply کنید)\n" +
+          "• " + KB.sharePhone + " — با رضایت شما، شماره‌تان ثبت می‌شود\n" +
           "• " + KB.account + " — نمایش حساب شما\n" +
           "• " + KB.ping + " — تست زنده بودن\n" +
           "• " + KB.time + " — زمان UTC\n" +
@@ -278,6 +317,35 @@ export default {
           (isAdmin(chatId) ? "\n• " + KB.stats + " — آمار کاربران (ادمین)" : ""),
           { reply_markup: keyboard }
         );
+
+      } else if (text === KB.products) {
+        await send(env, chatId, "لیست محصولات:", { reply_markup: keyboard });
+        await tg(env, "SendMessage", { // حروف کوچک-بزرگ مهم است؛ اما sendMessage درست است
+          chat_id: chatId,
+          text: "یک مورد انتخاب کن:",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "محصول ۱ (100k)", callback_data: "prod_1" },
+               { text: "محصول ۲ (175k)", callback_data: "prod_2" }],
+              [{ text: "محصول ۳ (450k)", callback_data: "prod_3" }],
+              [{ text: "بازگشت", callback_data: "back_home" }]
+            ]
+          }
+        }).catch(async () => {
+          // در صورت خطای تایپی متد بالا، نسخه صحیح:
+          await tg(env, "sendMessage", {
+            chat_id: chatId,
+            text: "یک مورد انتخاب کن:",
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "محصول ۱ (100k)", callback_data: "prod_1" },
+                 { text: "محصول ۲ (175k)", callback_data: "prod_2" }],
+                [{ text: "محصول ۳ (450k)", callback_data: "prod_3" }],
+                [{ text: "بازگشت", callback_data: "back_home" }]
+              ]
+            }
+          });
+        });
 
       } else if (text === KB.contact) {
         await send(env, chatId, "##ADMIN## لطفاً پیام خود را برای ادمین به‌صورت «پاسخ به همین پیام» ارسال کنید.", {
@@ -288,7 +356,7 @@ export default {
         await send(env, chatId, `👤 حساب شما:\nID: ${from.id}\nنام: ${(from.first_name||"") + " " + (from.last_name||"")}`.trim(), { reply_markup: keyboard });
 
       } else if (text === KB.ping || cmd === "ping") {
-        await send(env, chatId, "pong 🏓", { reply_markup: keyboard });
+        await send(env, chatId, "pong", { reply_markup: keyboard });
 
       } else if (text === KB.time || cmd === "time") {
         await send(env, chatId, `⏰ ${new Date().toISOString()}`, { reply_markup: keyboard });
@@ -300,7 +368,7 @@ export default {
         if (!isAdmin(from.id)) {
           await send(env, chatId, "این بخش فقط برای ادمین است.", { reply_markup: keyboard });
         } else if (!env.KV) {
-          await send(env, chatId, "KV وصل نیست. در Settings → Bindings با Variable = KV اضافه کن.", { reply_markup: keyboard });
+          await send(env, chatId, "KV وصل نیست.", { reply_markup: keyboard });
         } else {
           const users = await getUserCount(env);
           const phones = await getPhonesCount(env);
@@ -311,26 +379,21 @@ export default {
             const t = u.ts ? new Date(u.ts).toISOString() : "";
             return `${i+1}. ${name}${uname} | ID: ${u.id} | ${t}`;
           }).join("\n") || "—";
-          const usersCsvUrl  = `${base}/export/users.csv?secret=${encodeURIComponent(exportSecret)}`;
-          const phonesCsvUrl = `${base}/export/phones.csv?secret=${encodeURIComponent(exportSecret)}`;
+
           await tg(env, "sendMessage", {
             chat_id: chatId,
             text: `📊 آمار:\nکاربر یکتا: ${users}\nشمارهٔ ثبت‌شده: ${phones}\n\nآخرین ۱۰ کاربر:\n${lines}`,
             reply_markup: {
               inline_keyboard: [
-                [{ text: "⬇️ CSV کاربران", url: usersCsvUrl }, { text: "⬇️ CSV شماره‌ها", url: phonesCsvUrl }]
+                [{ text: "CSV کاربران", callback_data: "csv_users" },
+                 { text: "CSV شماره‌ها", callback_data: "csv_phones" }]
               ]
             }
           });
         }
 
-      } else if (cmd === "echo") {
-        await send(env, chatId, args.length ? args.join(" ") : "چیزی برای echo ندادید.", { reply_markup: keyboard });
-
-      } else if (cmd) {
-        await send(env, chatId, "این مورد در کیبورد نیست. از دکمه‌های پایین استفاده کن یا ℹ️ راهنما را بزن.", { reply_markup: keyboard });
-
       } else {
+        // fallback echo
         await send(env, chatId, text || "پیام متنی نفرستادی 🙂", { reply_markup: keyboard });
       }
 

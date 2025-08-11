@@ -1,6 +1,18 @@
-name = 'telbottest'
+name = "telbottest"
 main = "worker.js"
 compatibility_date = "2024-10-01"
+workers_dev = true
+account_id = "e4ebd6d4925fe9c43dca494a9a0fe835"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "261ee020d94442a9be799a7bba9a3d9b"
+
+[env.preview]
+[[env.preview.kv_namespaces]]
+binding = "KV"
+id = "261ee020d94442a9be799a7bba9a3d9b"
 
 [vars]
-WH_SECRET = "secret123"
+WH_SECRET = "dhcj0675121971"
+ADMIN_EXPORT_SECRET = "Don_4420471219719510"

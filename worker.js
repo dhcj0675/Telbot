@@ -3,6 +3,7 @@
 
 const ADMINS = [6803856798]; // آیدی عددی ادمین‌ها
 
+// ——— Labels (دکمه‌ها)
 const KB = {
   home: "خانه",
   help: "راهنما",
@@ -15,6 +16,7 @@ const KB = {
   sharePhone: "ارسال شماره من",
 };
 
+// ——— Reply Keyboard (نمایش پایین چت)
 const REPLY_KB = {
   keyboard: [
     [{ text: KB.home }, { text: KB.help }],
@@ -28,24 +30,21 @@ const REPLY_KB = {
   input_field_placeholder: "از دکمه‌های پایین انتخاب کن…",
 };
 
-// --- Telegram helpers ---
+// ——— Telegram helpers
 const tg = async (env, method, payload) => {
   const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload || {}),
   });
-  // ساده نگه می‌داریم
-  return r.json().catch(() => ({}));
+  return r.json().catch(() => ({})); // ساده و مقاوم
 };
-
 const send = (env, chat_id, text, extra = {}) =>
   tg(env, "sendMessage", { chat_id, text, ...extra });
-
 const answerCallback = (env, id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
 
-// --- محصولات (دکمه‌های اینلاین) ---
+// ——— محصولات (اینلاین‌باتن‌ها)
 async function showProducts(env, chatId) {
   await tg(env, "sendMessage", {
     chat_id: chatId,
@@ -91,10 +90,9 @@ async function handleMessage(update, env) {
   const from = msg.from || {};
   const text = msg.text || "";
 
-  // دریافت شماره کاربر
+  // دریافت شماره کاربر (به ادمین‌ها اطلاع می‌دهیم و به کاربر تأیید می‌دهیم)
   if (msg.contact && msg.contact.user_id === from.id) {
     const phone = msg.contact.phone_number;
-    // اطلاع به ادمین‌ها
     for (const admin of ADMINS) {
       await send(
         env,
@@ -108,13 +106,13 @@ async function handleMessage(update, env) {
     return;
   }
 
-  // همیشه با /start منو را نمایش بده
+  // /start → همیشه منو را نشان بده
   if (text === "/start") {
     await send(env, chatId, "سلام! ربات فعّاله ✅", { reply_markup: REPLY_KB });
     return;
   }
 
-  // دستور جدید /menu برای باز کردن مجدد منو
+  // /menu → باز کردن مجدد منو
   if (text === "/menu") {
     await send(env, chatId, "منو باز شد ✅", { reply_markup: REPLY_KB });
     return;
@@ -129,7 +127,7 @@ async function handleMessage(update, env) {
     await send(
       env,
       chatId,
-      "راهنما:\n• محصولات\n• پیام به ادمین (با Reply)\n• ارسال شماره من\n• حساب/پینگ/زمان/من کیم",
+      "راهنما:\n• محصولات را ببین\n• پیام به ادمین را با Reply بفرست\n• ارسال شماره من برای اشتراک شماره\n• حساب/پینگ/زمان/من کیم هم آماده‌ست",
       { reply_markup: REPLY_KB }
     );
     return;
@@ -169,7 +167,7 @@ async function handleMessage(update, env) {
   }
   const repliedText = msg.reply_to_message?.text || "";
   if (repliedText && repliedText.includes("##ADMIN##")) {
-    // فوروارد سادهٔ پیام کاربر برای ادمین‌ها
+    // ارسال پیام کاربر برای ادمین‌ها + تأیید به خود کاربر
     for (const admin of ADMINS) {
       await send(
         env,

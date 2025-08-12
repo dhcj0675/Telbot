@@ -1,3 +1,6 @@
 name = "telbottest"         # اسم سرویست در Cloudflare (دلخواه خودت)
 main = "worker.js"          # مسیر فایل ورکر؛ اگر جاش فرق داره، اینو عوض کن (مثلاً "src/worker.js")
 compatibility_date = "2024-10-01"
+# wrangler.toml (wrangler v3.88.0^)
+[observability.logs]
+enabled = true

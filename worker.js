@@ -1,9 +1,9 @@
-// worker.js — ربات ساده با منوی لیبلی + محصولات + سفارش با Reply (بدون KV)
-// Fast ACK: پاسخ فوری به تلگرام و پردازش در پس‌زمینه
+// worker.js — منوی لیبلی + محصولات + سفارش با حالت مکالمه (نام/آدرس) + آمار ساده (بدون KV)
+// Fast ACK
 
 const ADMINS = [6803856798]; // آیدی عددی ادمین‌ها
 
-// ——— Labels (دکمه‌ها)
+// ——— Labels
 const KB = {
   home: "خانه",
   help: "راهنما",
@@ -16,7 +16,6 @@ const KB = {
   sharePhone: "ارسال شماره من",
 };
 
-// ——— Reply Keyboard (نمایش پایین چت)
 const REPLY_KB = {
   keyboard: [
     [{ text: KB.home }, { text: KB.help }],
@@ -37,24 +36,28 @@ const tg = async (env, method, payload) => {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload || {}),
   });
-  return r.json().catch(() => ({})); // ساده و مقاوم
+  return r.json().catch(() => ({}));
 };
 const send = (env, chat_id, text, extra = {}) =>
   tg(env, "sendMessage", { chat_id, text, ...extra });
 const answerCallback = (env, id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
 
-// ——— محصولات و سفارش
+// ——— محصولات
 const PRODUCTS = {
   "1": { title: "محصول ۱", price: "100,000 تومان" },
   "2": { title: "محصول ۲", price: "175,000 تومان" },
   "3": { title: "محصول ۳", price: "450,000 تومان" },
 };
-
-function productDetailsText(pid) {
+const productText = (pid) => {
   const p = PRODUCTS[pid];
-  return `${p.title} — قیمت: ${p.price}`;
-}
+  return p ? `${p.title} — قیمت: ${p.price}` : "محصول نامعتبر";
+};
+
+// ——— حالت مکالمه سفارش (در حافظه موقتِ اجرا)
+const ORDER_STATE = new Map(); // chatId -> { pid, step: 'ask_name'|'ask_address', data:{name,address} }
+let MSG_COUNT = 0;
+let ORDER_COUNT = 0;
 
 async function showProducts(env, chatId) {
   await tg(env, "sendMessage", {
@@ -76,7 +79,7 @@ async function showProducts(env, chatId) {
 async function showProduct(env, chatId, pid) {
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: productDetailsText(pid),
+    text: productText(pid),
     reply_markup: {
       inline_keyboard: [
         [{ text: "🛒 سفارش این محصول", callback_data: `order_${pid}` }],
@@ -86,13 +89,12 @@ async function showProduct(env, chatId, pid) {
   });
 }
 
-async function startOrder(env, chatId, pid) {
-  // پیام با مارکر مخصوص برای Reply
+async function startOrderFlow(env, chatId, pid) {
+  ORDER_STATE.set(chatId, { pid, step: "ask_name", data: {} });
   await send(
     env,
     chatId,
-    `##ORDER:${pid}##\nبرای ثبت سفارش، نام و توضیحاتت رو روی همین پیام **Reply** کن.\n` +
-      `می‌تونی دکمه «${KB.sharePhone}» رو هم بزنی تا شماره‌ات به ادمین برسه.`,
+    `سفارش «${productText(pid)}»\n\nلطفاً *نام و نام خانوادگی* خود را ارسال کنید.\n(در هر لحظه با /cancel می‌تونی لغو کنی)`,
     { reply_markup: REPLY_KB, parse_mode: "Markdown" }
   );
 }
@@ -107,7 +109,7 @@ async function handleCallback(update, env) {
     await showProduct(env, chatId, pid);
   } else if (data.startsWith("order_")) {
     const pid = data.split("_")[1];
-    await startOrder(env, chatId, pid);
+    await startOrderFlow(env, chatId, pid);
   } else if (data === "back_home") {
     await send(env, chatId, "به خانه برگشتی.", { reply_markup: REPLY_KB });
   } else {
@@ -118,9 +120,53 @@ async function handleCallback(update, env) {
 }
 
 async function notifyAdmins(env, text) {
-  for (const admin of ADMINS) {
-    await send(env, admin, text);
+  for (const admin of ADMINS) await send(env, admin, text);
+}
+
+async function handleOrderConversation(env, msg, from, chatId, text) {
+  const st = ORDER_STATE.get(chatId);
+  if (!st) return false;
+
+  if (text === "/cancel") {
+    ORDER_STATE.delete(chatId);
+    await send(env, chatId, "سفارش لغو شد ❌", { reply_markup: REPLY_KB });
+    return true;
   }
+
+  if (st.step === "ask_name") {
+    st.data.name = text.trim();
+    st.step = "ask_address";
+    ORDER_STATE.set(chatId, st);
+    await send(env, chatId, "خیلی خوب! حالا *آدرس کامل* رو بفرست:", {
+      reply_markup: REPLY_KB,
+      parse_mode: "Markdown",
+    });
+    return true;
+  }
+
+  if (st.step === "ask_address") {
+    st.data.address = text.trim();
+    const pid = st.pid;
+    const p = PRODUCTS[pid];
+    ORDER_STATE.delete(chatId);
+    ORDER_COUNT++;
+
+    // ارسال خلاصه سفارش برای ادمین
+    const summary =
+      `🧾 سفارش جدید\n` +
+      `محصول: ${p ? `${p.title} (${p.price})` : pid}\n\n` +
+      `از:\nID: ${from.id}\n` +
+      (from.username ? `@${from.username}\n` : "") +
+      `نام: ${(from.first_name || "") + " " + (from.last_name || "")}\n\n` +
+      `📌 نام مشتری: ${st.data.name}\n` +
+      `📍 آدرس: ${st.data.address}`;
+
+    await notifyAdmins(env, summary);
+    await send(env, chatId, "سفارش‌ت ثبت شد و برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
+    return true;
+  }
+
+  return false;
 }
 
 async function handleMessage(update, env) {
@@ -129,9 +175,10 @@ async function handleMessage(update, env) {
 
   const chatId = msg.chat.id;
   const from = msg.from || {};
-  const text = msg.text || "";
+  const text = (msg.text || "").trim();
+  MSG_COUNT++;
 
-  // دریافت شماره کاربر → اطلاع به ادمین + تایید به کاربر
+  // شماره کاربر
   if (msg.contact && msg.contact.user_id === from.id) {
     const phone = msg.contact.phone_number;
     await notifyAdmins(
@@ -144,19 +191,25 @@ async function handleMessage(update, env) {
     return;
   }
 
-  // /start → همیشه منو را نشان بده
+  // اگر در حالت سفارش هستیم، اول همون رو مدیریت کن
+  if (await handleOrderConversation(env, msg, from, chatId, text)) return;
+
+  // دستورات پایه
   if (text === "/start") {
     await send(env, chatId, "سلام! ربات فعّاله ✅", { reply_markup: REPLY_KB });
     return;
   }
-
-  // /menu → باز کردن مجدد منو
   if (text === "/menu") {
     await send(env, chatId, "منو باز شد ✅", { reply_markup: REPLY_KB });
     return;
   }
+  if (text === "/cancel") {
+    ORDER_STATE.delete(chatId);
+    await send(env, chatId, "اگر سفارشی در جریان بود، لغو شد.", { reply_markup: REPLY_KB });
+    return;
+  }
 
-  // مسیرهای ساده
+  // مسیرها
   if (text === KB.home) {
     await send(env, chatId, "صفحهٔ اول.", { reply_markup: REPLY_KB });
     return;
@@ -165,7 +218,7 @@ async function handleMessage(update, env) {
     await send(
       env,
       chatId,
-      "راهنما:\n• محصولات را ببین و «سفارش» بزن\n• پیام به ادمین را با Reply بفرست\n• با «ارسال شماره من» شماره‌ات را بده\n• حساب/پینگ/زمان/من کیم هم آماده‌ست",
+      "راهنما:\n• محصولات → سفارش با نام و آدرس\n• پیام به ادمین با Reply\n• ارسال شماره من\n• /menu برای نمایش منو\n• /cancel لغو سفارش جاری",
       { reply_markup: REPLY_KB }
     );
     return;
@@ -196,42 +249,25 @@ async function handleMessage(update, env) {
     return;
   }
 
-  // پیام به ادمین: کاربر باید روی پیام زیر Reply کند
+  // پیام به ادمین: Reply روی پیام خاص
   if (text === KB.contact) {
     await send(env, chatId, "##ADMIN## لطفاً پیام‌تان را به صورت Reply به همین پیام بفرستید.", {
       reply_markup: { force_reply: true, selective: true },
     });
     return;
   }
-
-  // ریپلای به سفارش یا پیام ادمین → ارسال به ادمین + تایید به کاربر
   const repliedText = msg.reply_to_message?.text || "";
-  if (repliedText) {
-    if (repliedText.includes("##ORDER:")) {
-      // استخراج Product ID از مارکر
-      const m = repliedText.match(/##ORDER:(\d+)##/);
-      const pid = m?.[1] || "?";
-      const p = PRODUCTS[pid] ? `${PRODUCTS[pid].title} (${PRODUCTS[pid].price})` : `محصول ${pid}`;
-      await notifyAdmins(
-        env,
-        `🧾 سفارش جدید:\nمحصول: ${p}\n\nاز:\nID: ${from.id}\n${from.username ? `@${from.username}\n` : ""}` +
-          `نام: ${(from.first_name || "") + " " + (from.last_name || "")}\n\nمتن کاربر:\n${text}`
-      );
-      await send(env, chatId, "سفارش‌ت ثبت و برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
-      return;
-    }
-    if (repliedText.includes("##ADMIN##")) {
-      await notifyAdmins(
-        env,
-        `📥 پیام کاربر برای ادمین:\nID: ${from.id}\n${from.username ? `@${from.username}\n` : ""}\n` +
-          `متن:\n${text}`
-      );
-      await send(env, chatId, "پیام‌تون برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
-      return;
-    }
+  if (repliedText && repliedText.includes("##ADMIN##")) {
+    await notifyAdmins(
+      env,
+      `📥 پیام کاربر برای ادمین:\nID: ${from.id}\n${from.username ? `@${from.username}\n` : ""}\n` +
+        `متن:\n${text}`
+    );
+    await send(env, chatId, "پیام‌تون برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
+    return;
   }
 
-  // پیش‌فرض: اکو + نمایش منو
+  // پیش‌فرض: اکو
   await send(env, chatId, `Echo: ${text}`, { reply_markup: REPLY_KB });
 }
 
@@ -254,16 +290,29 @@ export default {
         headers: { "content-type": "application/json" },
       });
 
-    // وبهوک تلگرام (Fast ACK)
+    // وبهوک تلگرام
     if (request.method === "POST" && url.pathname === `/webhook/${env.WH_SECRET}`) {
       const hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
       if (env.TG_SECRET_TOKEN && hdr !== env.TG_SECRET_TOKEN)
         return new Response("forbidden", { status: 403 });
 
-      let update = null;
-      try { update = await request.json(); } catch {}
+      let update = null; try { update = await request.json(); } catch {}
       ctx.waitUntil(handleUpdate(update, env)); // پس‌زمینه
       return new Response("ok");               // فوری
+    }
+
+    // آمار ساده (فقط برای ادمین — با query ?id=<admin_id>)
+    if (request.method === "GET" && url.pathname === "/stats") {
+      const id = Number(url.searchParams.get("id") || "0");
+      if (!ADMINS.includes(id)) return new Response("forbidden", { status: 403 });
+      const body = {
+        ok: true,
+        since: "since last deploy / hot start",
+        messages: MSG_COUNT,
+        orders: ORDER_COUNT,
+        active_conversations: ORDER_STATE.size,
+      };
+      return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
     }
 
     return new Response("not found", { status: 404 });

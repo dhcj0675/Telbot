@@ -1,4 +1,4 @@
-// worker.js — ربات ساده با منوی لیبلی، محصولات، پیام به ادمین (بدون KV)
+// worker.js — ربات ساده با منوی لیبلی + محصولات + سفارش با Reply (بدون KV)
 // Fast ACK: پاسخ فوری به تلگرام و پردازش در پس‌زمینه
 
 const ADMINS = [6803856798]; // آیدی عددی ادمین‌ها
@@ -44,7 +44,18 @@ const send = (env, chat_id, text, extra = {}) =>
 const answerCallback = (env, id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
 
-// ——— محصولات (اینلاین‌باتن‌ها)
+// ——— محصولات و سفارش
+const PRODUCTS = {
+  "1": { title: "محصول ۱", price: "100,000 تومان" },
+  "2": { title: "محصول ۲", price: "175,000 تومان" },
+  "3": { title: "محصول ۳", price: "450,000 تومان" },
+};
+
+function productDetailsText(pid) {
+  const p = PRODUCTS[pid];
+  return `${p.title} — قیمت: ${p.price}`;
+}
+
 async function showProducts(env, chatId) {
   await tg(env, "sendMessage", {
     chat_id: chatId,
@@ -62,17 +73,41 @@ async function showProducts(env, chatId) {
   });
 }
 
+async function showProduct(env, chatId, pid) {
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: productDetailsText(pid),
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🛒 سفارش این محصول", callback_data: `order_${pid}` }],
+        [{ text: "بازگشت", callback_data: "back_home" }],
+      ],
+    },
+  });
+}
+
+async function startOrder(env, chatId, pid) {
+  // پیام با مارکر مخصوص برای Reply
+  await send(
+    env,
+    chatId,
+    `##ORDER:${pid}##\nبرای ثبت سفارش، نام و توضیحاتت رو روی همین پیام **Reply** کن.\n` +
+      `می‌تونی دکمه «${KB.sharePhone}» رو هم بزنی تا شماره‌ات به ادمین برسه.`,
+    { reply_markup: REPLY_KB, parse_mode: "Markdown" }
+  );
+}
+
 async function handleCallback(update, env) {
   const cq = update.callback_query;
   const chatId = cq.message?.chat?.id;
   const data = cq.data || "";
 
-  if (data === "prod_1") {
-    await send(env, chatId, "محصول ۱ — قیمت: 100,000 تومان", { reply_markup: REPLY_KB });
-  } else if (data === "prod_2") {
-    await send(env, chatId, "محصول ۲ — قیمت: 175,000 تومان", { reply_markup: REPLY_KB });
-  } else if (data === "prod_3") {
-    await send(env, chatId, "محصول ۳ — قیمت: 450,000 تومان", { reply_markup: REPLY_KB });
+  if (data.startsWith("prod_")) {
+    const pid = data.split("_")[1];
+    await showProduct(env, chatId, pid);
+  } else if (data.startsWith("order_")) {
+    const pid = data.split("_")[1];
+    await startOrder(env, chatId, pid);
   } else if (data === "back_home") {
     await send(env, chatId, "به خانه برگشتی.", { reply_markup: REPLY_KB });
   } else {
@@ -80,6 +115,12 @@ async function handleCallback(update, env) {
   }
 
   await answerCallback(env, cq.id);
+}
+
+async function notifyAdmins(env, text) {
+  for (const admin of ADMINS) {
+    await send(env, admin, text);
+  }
 }
 
 async function handleMessage(update, env) {
@@ -90,18 +131,15 @@ async function handleMessage(update, env) {
   const from = msg.from || {};
   const text = msg.text || "";
 
-  // دریافت شماره کاربر (به ادمین‌ها اطلاع می‌دهیم و به کاربر تأیید می‌دهیم)
+  // دریافت شماره کاربر → اطلاع به ادمین + تایید به کاربر
   if (msg.contact && msg.contact.user_id === from.id) {
     const phone = msg.contact.phone_number;
-    for (const admin of ADMINS) {
-      await send(
-        env,
-        admin,
-        `📥 شمارهٔ کاربر:\nID: ${from.id}\nنام: ${(from.first_name || "") + " " + (from.last_name || "")}\n` +
-          (from.username ? `@${from.username}\n` : "") +
-          `تلفن: ${phone}`
-      );
-    }
+    await notifyAdmins(
+      env,
+      `📥 شمارهٔ کاربر:\nID: ${from.id}\nنام: ${(from.first_name || "") + " " + (from.last_name || "")}\n` +
+        (from.username ? `@${from.username}\n` : "") +
+        `تلفن: ${phone}`
+    );
     await send(env, chatId, "شماره‌ات دریافت شد ✅", { reply_markup: REPLY_KB });
     return;
   }
@@ -127,7 +165,7 @@ async function handleMessage(update, env) {
     await send(
       env,
       chatId,
-      "راهنما:\n• محصولات را ببین\n• پیام به ادمین را با Reply بفرست\n• ارسال شماره من برای اشتراک شماره\n• حساب/پینگ/زمان/من کیم هم آماده‌ست",
+      "راهنما:\n• محصولات را ببین و «سفارش» بزن\n• پیام به ادمین را با Reply بفرست\n• با «ارسال شماره من» شماره‌ات را بده\n• حساب/پینگ/زمان/من کیم هم آماده‌ست",
       { reply_markup: REPLY_KB }
     );
     return;
@@ -165,19 +203,32 @@ async function handleMessage(update, env) {
     });
     return;
   }
+
+  // ریپلای به سفارش یا پیام ادمین → ارسال به ادمین + تایید به کاربر
   const repliedText = msg.reply_to_message?.text || "";
-  if (repliedText && repliedText.includes("##ADMIN##")) {
-    // ارسال پیام کاربر برای ادمین‌ها + تأیید به خود کاربر
-    for (const admin of ADMINS) {
-      await send(
+  if (repliedText) {
+    if (repliedText.includes("##ORDER:")) {
+      // استخراج Product ID از مارکر
+      const m = repliedText.match(/##ORDER:(\d+)##/);
+      const pid = m?.[1] || "?";
+      const p = PRODUCTS[pid] ? `${PRODUCTS[pid].title} (${PRODUCTS[pid].price})` : `محصول ${pid}`;
+      await notifyAdmins(
         env,
-        admin,
+        `🧾 سفارش جدید:\nمحصول: ${p}\n\nاز:\nID: ${from.id}\n${from.username ? `@${from.username}\n` : ""}` +
+          `نام: ${(from.first_name || "") + " " + (from.last_name || "")}\n\nمتن کاربر:\n${text}`
+      );
+      await send(env, chatId, "سفارش‌ت ثبت و برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
+      return;
+    }
+    if (repliedText.includes("##ADMIN##")) {
+      await notifyAdmins(
+        env,
         `📥 پیام کاربر برای ادمین:\nID: ${from.id}\n${from.username ? `@${from.username}\n` : ""}\n` +
           `متن:\n${text}`
       );
+      await send(env, chatId, "پیام‌تون برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
+      return;
     }
-    await send(env, chatId, "پیام‌تون برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
-    return;
   }
 
   // پیش‌فرض: اکو + نمایش منو

@@ -2,12 +2,12 @@ name = "telbottest"
 main = "worker.js"
 compatibility_date = "2024-10-01"
 
+[[kv_namespaces]]
+binding = "KV"
+id = "261ee020d94442a9be799a7bba9a3d9b"   # همانی که در Dashboard می‌بینی
+
 [vars]
 WH_SECRET = "dhcj0675121971"
 TG_SECRET_TOKEN = "Dhcj_4420471219719510"
-BOT_TOKEN = "8385455358:AAHLGmyNa3aeOZSXY-hOec07BfT1Br_S-y8"
-ADMINS = "6803856798" # آیدی عددی ادمین‌ها با کاما جدا
-
-[[kv_namespaces]]
-binding = "KV"
-id = "261ee020d94442a9be799a7bba9a3d9b"
+ADMIN_EXPORT_SECRET = "Don_4420471219719510"
+# BOT_TOKEN را در Dashboard به عنوان Secret بگذار (نه داخل فایل)

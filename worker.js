@@ -1,5 +1,5 @@
-// worker.js — Phone Gate + Whitelist (managed in-bot) + Pending list + Health
-// نسخه: v1.5.0
+// worker.js — Phone Gate + KV Whitelist + Admin Label Menu + Pending list + Health
+// نسخه: v1.6.0
 
 /************ تنظیمات ************/
 const ADMINS = [6803856798]; // آی‌دی عددی ادمین‌ها
@@ -15,6 +15,7 @@ const KB = {
   time: "زمان",
   whoami: "من کیم",
   sharePhone: "ارسال شماره من",
+  adminPanel: "مدیریت ادمین", // ← جدید: دکمه لیبلی پنل ادمین
 };
 
 const REPLY_KB_USER = {
@@ -34,7 +35,7 @@ const REPLY_KB_ADMIN = {
     [{ text: KB.products }, { text: KB.account }],
     [{ text: KB.ping }, { text: KB.time }, { text: KB.whoami }],
     [{ text: KB.contact }, { text: KB.sharePhone, request_contact: true }],
-    // ابزارهای ادمین با کامند هستند (دکمه لیبلی لازم نیست)
+    [{ text: KB.adminPanel }], // ← دکمه لیبلی مخصوص ادمین
   ],
   resize_keyboard: true, is_persistent: true, one_time_keyboard: false,
   input_field_placeholder: "منوی ادمین",
@@ -70,10 +71,9 @@ const answerCallback = (env, id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
 
 /************ KV helpers (users/phones/whitelist) ************/
-const userKey       = (id) => `user:${id}`;
-const phoneKey      = (id) => `phone:${id}`;
-const wlKey         = (id) => `wl:${id}`;
-const promptedKey   = (id) => `phone_prompted:${id}`; // اگر خواستی محدودیت یادآوری بذاری
+const userKey     = (id) => `user:${id}`;
+const phoneKey    = (id) => `phone:${id}`;
+const wlKey       = (id) => `wl:${id}`;
 
 async function trackUserOnce(env, from) {
   if (!env.KV) return;
@@ -91,13 +91,12 @@ async function trackUserOnce(env, from) {
     }
   } catch (e) { console.error("KV trackUserOnce", e); }
 }
+const savePhone       = (env, id, phone) => env.KV?.put(phoneKey(id), phone);
+const hasPhone        = async (env, id) => env.KV ? !!(await env.KV.get(phoneKey(id))) : false;
 
-const savePhone        = (env, id, phone) => env.KV?.put(phoneKey(id), phone);
-const hasPhone         = async (env, id) => env.KV ? !!(await env.KV.get(phoneKey(id))) : false;
-
-const isWhitelistedKV  = async (env, id) => env.KV ? !!(await env.KV.get(wlKey(id))) : false;
-const addWhitelistKV   = (env, id) => env.KV?.put(wlKey(id), "1");
-const delWhitelistKV   = (env, id) => env.KV?.delete(wlKey(id));
+const isWhitelistedKV = async (env, id) => env.KV ? !!(await env.KV.get(wlKey(id))) : false;
+const addWhitelistKV  = (env, id) => env.KV?.put(wlKey(id), "1");
+const delWhitelistKV  = (env, id) => env.KV?.delete(wlKey(id));
 
 async function listWhitelistIds(env, limit = 200) {
   if (!env.KV) return [];
@@ -116,7 +115,25 @@ async function listRecentUsers(env, limit = 50) {
     .slice(0, limit);
 }
 
-/************ Admin notify (اختیاری برای دیباگ) ************/
+/************ Admin UI helpers ************/
+async function showAdminPanel(env, chatId) {
+  return tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: "مدیریت ادمین — یک گزینه را انتخاب کن:",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "📋 استارت‌زده‌ها بدون شماره", callback_data: "admin:pending" }],
+        [{ text: "📝 لیست وایت‌لیست", callback_data: "admin:listwhite" }],
+        [
+          { text: "➕ افزودن با آی‌دی", callback_data: "admin:add_prompt" },
+          { text: "🗑️ حذف با آی‌دی",  callback_data: "admin:del_prompt" }
+        ],
+      ],
+    },
+  });
+}
+
+/************ Admin notify (اختیاری) ************/
 async function notifyAdmins(env, from, text, tag = "") {
   const who = `${from.first_name||""} ${from.last_name||""}`.trim() || "کاربر";
   const head = `📥 ${tag?`(${tag}) `:""}از ${who}${from.username?` (@${from.username})`:""}\nID: ${from.id}\n\n`;
@@ -129,32 +146,71 @@ async function handleCallback(update, env) {
   const chatId = cq.message?.chat?.id;
   const data = cq.data || "";
 
-  if (!isAdmin(chatId)) {
-    await answerCallback(env, cq.id, "فقط برای ادمین.", true);
+  if (!isAdmin(chatId)) { await answerCallback(env, cq.id, "فقط برای ادمین.", true); return; }
+
+  // مدیریت وایت‌لیست از پنل
+  if (data === "admin:pending") {
+    await answerCallback(env, cq.id);
+    if (!env.KV) { await send(env, chatId, "KV وصل نیست."); return; }
+    const recent = await listRecentUsers(env, 50);
+    const pending = [];
+    for (const u of recent) {
+      const has = await env.KV.get(phoneKey(u.id));
+      if (!has) pending.push(u);
+      if (pending.length >= 20) break;
+    }
+    if (!pending.length) { await send(env, chatId, "🚀 کاربر بدون شماره در لیست اخیر نداریم."); return; }
+    const lines = pending.map((u,i)=>{
+      const name = `${u.first_name||""} ${u.last_name||""}`.trim() || "کاربر";
+      const un = u.username ? ` @${u.username}` : "";
+      return `${i+1}. ${name}${un} | ID: ${u.id}`;
+    }).join("\n");
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `آخرین استارت‌زده‌ها بدون شماره:\n\n${lines}\n\nروی دکمه‌ها کلیک کن:`,
+      reply_markup: {
+        inline_keyboard: pending.map(u => ([
+          { text: `➕ WL ${u.id}`, callback_data: `wl_add:${u.id}` }
+        ]))
+      }
+    });
     return;
   }
 
+  if (data === "admin:listwhite") {
+    await answerCallback(env, cq.id);
+    const ids = await listWhitelistIds(env, 200);
+    await send(env, chatId, ids.length ? `Whitelist:\n${ids.join("\n")}` : "وایت‌لیست خالی است.");
+    return;
+  }
+
+  if (data === "admin:add_prompt") {
+    await answerCallback(env, cq.id);
+    await send(env, chatId, "##ADMIN:ADDWL##\nآی‌دی عددی کاربر را ریپلای کنید.", {
+      reply_markup: { force_reply: true, selective: true },
+    });
+    return;
+  }
+
+  if (data === "admin:del_prompt") {
+    await answerCallback(env, cq.id);
+    await send(env, chatId, "##ADMIN:DELWL##\nآی‌دی عددی کاربر را ریپلای کنید.", {
+      reply_markup: { force_reply: true, selective: true },
+    });
+    return;
+  }
+
+  // دکمه‌های کاربری wl_add / wl_del
   if (data.startsWith("wl_add:")) {
     const uid = parseInt(data.split(":")[1], 10);
-    if (uid) {
-      await addWhitelistKV(env, uid);
-      await answerCallback(env, cq.id, `Added WL: ${uid}`);
-      await send(env, chatId, `✅ کاربر ${uid} به وایت‌لیست اضافه شد.`);
-    } else {
-      await answerCallback(env, cq.id, "ID نامعتبر", true);
-    }
+    if (uid) { await addWhitelistKV(env, uid); await answerCallback(env, cq.id, `Added WL: ${uid}`); await send(env, chatId, `✅ کاربر ${uid} به وایت‌لیست اضافه شد.`); }
+    else { await answerCallback(env, cq.id, "ID نامعتبر", true); }
     return;
   }
-
   if (data.startsWith("wl_del:")) {
     const uid = parseInt(data.split(":")[1], 10);
-    if (uid) {
-      await delWhitelistKV(env, uid);
-      await answerCallback(env, cq.id, `Removed WL: ${uid}`);
-      await send(env, chatId, `🗑️ کاربر ${uid} از وایت‌لیست حذف شد.`);
-    } else {
-      await answerCallback(env, cq.id, "ID نامعتبر", true);
-    }
+    if (uid) { await delWhitelistKV(env, uid); await answerCallback(env, cq.id, `Removed WL: ${uid}`); await send(env, chatId, `🗑️ کاربر ${uid} از وایت‌لیست حذف شد.`); }
+    else { await answerCallback(env, cq.id, "ID نامعتبر", true); }
     return;
   }
 
@@ -175,7 +231,7 @@ async function handleMessage(update, env) {
   // ثبت کاربر
   trackUserOnce(env, from);
 
-  // دریافت شماره (در هر حالت)
+  // دریافت شماره
   if (msg.contact && msg.contact.user_id === from.id) {
     const phone = msg.contact.phone_number;
     await savePhone(env, from.id, phone);
@@ -196,104 +252,55 @@ async function handleMessage(update, env) {
     }
   }
 
-  // ——— Commands پایه
-  if (text === "/start") {
-    await send(env, chatId, "سلام! ربات فعّاله ✅", { reply_markup: kb });
-    return;
-  }
-  if (text === "/menu") {
-    await send(env, chatId, "منو باز شد ✅", { reply_markup: kb });
-    return;
-  }
-  if (text === "/ping" || text === KB.ping) {
-    await send(env, chatId, "pong 🏓", { reply_markup: kb });
-    return;
-  }
-  if (text === "/time" || text === KB.time) {
-    await send(env, chatId, `⏰ ${new Date().toISOString()}`, { reply_markup: kb });
-    return;
-  }
-  if (text === KB.whoami || text === "/whoami") {
-    await send(env, chatId, `👤 ID: ${from.id}`, { reply_markup: kb });
-    return;
-  }
-  if (text === KB.help || text === "/help") {
+  // دستورات پایه
+  if (text === "/start") { await send(env, chatId, "سلام! ربات فعّاله ✅", { reply_markup: kb }); return; }
+  if (text === "/menu")  { await send(env, chatId, "منو باز شد ✅", { reply_markup: kb }); return; }
+  if (text === KB.ping || text === "/ping") { await send(env, chatId, "pong 🏓", { reply_markup: kb }); return; }
+  if (text === KB.time || text === "/time") { await send(env, chatId, `⏰ ${new Date().toISOString()}`, { reply_markup: kb }); return; }
+  if (text === KB.whoami || text === "/whoami") { await send(env, chatId, `👤 ID: ${from.id}`, { reply_markup: kb }); return; }
+  if (text === KB.help  || text === "/help") {
     await send(env, chatId,
-      "راهنما:\n• ارسال شماره من\n• پیام به ادمین (Reply)\n• /menu برای نمایش منو\n• ادمین: /pending , /addwhite , /delwhite , /listwhite",
+      "راهنما:\n• ارسال شماره من\n• پیام به ادمین (Reply)\n• /menu برای نمایش منو\n• ادمین: دکمه «مدیریت ادمین»",
       { reply_markup: kb }
-    );
+    ); return;
+  }
+
+  // پنل ادمین (لیبلی)
+  if (isAdmin(from.id) && text === KB.adminPanel) {
+    await showAdminPanel(env, chatId);
     return;
   }
 
-  // ——— Admin tools (مدیریت وایت‌لیست)
-  if (isAdmin(from.id) && text === "/listwhite") {
-    const ids = await listWhitelistIds(env, 200);
-    await send(env, chatId, ids.length ? `Whitelist:\n${ids.join("\n")}` : "وایت‌لیست خالی است.");
-    return;
-  }
-
-  if (isAdmin(from.id) && text.startsWith("/addwhite ")) {
-    const uid = parseInt(text.split(/\s+/)[1], 10);
-    if (!uid) { await send(env, chatId, "استفاده: /addwhite <user_id>", { reply_markup: kb }); return; }
+  // پاسخ به پیام‌های «افزودن/حذف با آی‌دی» (Reply)
+  const repliedText = msg.reply_to_message?.text || "";
+  if (isAdmin(from.id) && repliedText.includes("##ADMIN:ADDWL##")) {
+    const uid = parseInt(text, 10);
+    if (!uid) { await send(env, chatId, "آی‌دی نامعتبر است. فقط عدد بفرست."); return; }
     await addWhitelistKV(env, uid);
-    await send(env, chatId, `✅ کاربر ${uid} به وایت‌لیست اضافه شد.`, { reply_markup: kb });
+    await send(env, chatId, `✅ کاربر ${uid} به وایت‌لیست اضافه شد.`);
     return;
   }
-
-  if (isAdmin(from.id) && text.startsWith("/delwhite ")) {
-    const uid = parseInt(text.split(/\s+/)[1], 10);
-    if (!uid) { await send(env, chatId, "استفاده: /delwhite <user_id>", { reply_markup: kb }); return; }
+  if (isAdmin(from.id) && repliedText.includes("##ADMIN:DELWL##")) {
+    const uid = parseInt(text, 10);
+    if (!uid) { await send(env, chatId, "آی‌دی نامعتبر است. فقط عدد بفرست."); return; }
     await delWhitelistKV(env, uid);
-    await send(env, chatId, `🗑️ کاربر ${uid} از وایت‌لیست حذف شد.`, { reply_markup: kb });
+    await send(env, chatId, `🗑️ کاربر ${uid} از وایت‌لیست حذف شد.`);
     return;
   }
 
-  if (isAdmin(from.id) && text === "/pending") {
-    if (!env.KV) { await send(env, chatId, "KV وصل نیست."); return; }
-    // آخرین 50 کاربر → فیلتر به کسانی که شماره ندارند (تا 20 مورد)
-    const recent = await listRecentUsers(env, 50);
-    const pending = [];
-    for (const u of recent) {
-      const has = await env.KV.get(phoneKey(u.id));
-      if (!has) pending.push(u);
-      if (pending.length >= 20) break;
-    }
-    if (!pending.length) {
-      await send(env, chatId, "🚀 کاربر بدون شماره در لیست اخیر نداریم.");
-      return;
-    }
-    const lines = pending.map((u,i)=>{
-      const name = `${u.first_name||""} ${u.last_name||""}`.trim() || "کاربر";
-      const un = u.username ? ` @${u.username}` : "";
-      return `${i+1}. ${name}${un} | ID: ${u.id}`;
-    }).join("\n");
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text: `آخرین استارت‌زده‌ها بدون شماره:\n\n${lines}\n\nروی دکمه‌ها کلیک کن:`,
-      reply_markup: {
-        inline_keyboard: pending.map(u => ([
-          { text: `➕ WL ${u.id}`, callback_data: `wl_add:${u.id}` }
-        ]))
-      }
-    });
-    return;
-  }
-
-  // ——— پیام به ادمین
+  // پیام به ادمین
   if (text === KB.contact) {
     await send(env, chatId, "##ADMIN## لطفاً پیام‌تان را به صورت Reply به همین پیام بفرستید.", {
       reply_markup: { force_reply: true, selective: true },
-    });
-    return;
+    }); return;
   }
-  const repliedText = msg.reply_to_message?.text || "";
   if (repliedText && repliedText.includes("##ADMIN##")) {
     if (text) await notifyAdmins(env, from, text, "contact");
     await send(env, chatId, "پیامت ارسال شد ✅", { reply_markup: kb });
     return;
   }
 
-  // ——— پیش‌فرض: Echo
+  // پیش‌فرض: Echo
   await send(env, chatId, `Echo: ${raw}`, { reply_markup: kb });
 }
 
@@ -309,9 +316,9 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Health + Version روی روت
+    // Health + Version
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(JSON.stringify({ ok: true, ver: "v1.5.0" }), {
+      return new Response(JSON.stringify({ ok: true, ver: "v1.6.0" }), {
         headers: { "content-type": "application/json" },
       });
     }

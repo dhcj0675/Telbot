@@ -1,13 +1,14 @@
 // worker.js — Bot + CSV + /version  (بدون Termux)
-// - Reply Keyboard + محصولات + پیام به ادمین + ارسال شماره
-// - CSV: /export/users.csv و /export/phones.csv با secret
-// - /version برای تست دیپلوی
-// نیازها: BOT_TOKEN (Secret) ، WH_SECRET (vars یا TOML)
+// قابلیت‌ها:
+// - Reply Keyboard + محصولات + سفارش با Reply + پیام به ادمین + ارسال شماره
+// - CSV: /export/users.csv و /export/phones.csv (با secret)
+// - /version برای تست سریع دیپلوی
+// نیازها: BOT_TOKEN (Secret) ، WH_SECRET (در wrangler.toml یا Dashboard - یکی را انتخاب کن)
 // اختیاری: TG_SECRET_TOKEN (Secret)، ADMIN_EXPORT_SECRET (Secret)
-// اختیاری برای CSV: KV بایند با نام دقیقاً "KV"
+// اختیاری برای CSV: KV با نام بایند دقیقاً "KV"
 
-const ADMINS = [6803856798]; // آیدی عددی ادمین‌ها (تو می‌تونی تغییر بدی)
-const VERSION = "csv-enabled-1";
+const ADMINS = [6803856798];              // آیدی عددی ادمین‌ها
+const VERSION = "v1.0.0";                 // هر دیپلوی عوضش کن تا /version را چک کنی
 
 // ——— Labels
 const KB = {
@@ -42,7 +43,6 @@ const tg = async (env, method, payload) => {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload || {}),
   });
-  // لاگِ خطای تلگرام برای دیباگ
   if (!r.ok) {
     const t = await r.text().catch(() => "");
     console.error("TG", method, r.status, t);
@@ -98,7 +98,6 @@ async function showProduct(env, chatId, pid) {
   });
 }
 async function startOrder(env, chatId, pid) {
-  // سفارش با Reply (بدون state/KV)
   await send(
     env,
     chatId,
@@ -128,22 +127,17 @@ async function trackUserOnce(env, from) {
         })
       );
     }
-  } catch (e) {
-    console.error("KV trackUserOnce", e);
-  }
+  } catch (e) { console.error("KV trackUserOnce", e); }
 }
 async function savePhone(env, id, phone) {
   if (!hasKV(env)) return;
-  try {
-    await env.KV.put(`phone:${id}`, phone);
-  } catch (e) {
-    console.error("KV savePhone", e);
-  }
+  try { await env.KV.put(`phone:${id}`, phone); }
+  catch (e) { console.error("KV savePhone", e); }
 }
 async function buildUsersCSV(env) {
   if (!hasKV(env)) return "id,username,first_name,last_name,ts_iso\n";
   const list = await env.KV.list({ prefix: "user:" });
-  const rows = [["id", "username", "first_name", "last_name", "ts_iso"]];
+  const rows = [["id","username","first_name","last_name","ts_iso"]];
   for (const { name } of list.keys) {
     const v = await env.KV.get(name);
     if (!v) continue;
@@ -161,7 +155,7 @@ async function buildUsersCSV(env) {
 async function buildPhonesCSV(env) {
   if (!hasKV(env)) return "id,phone,username,first_name,last_name,ts_iso\n";
   const list = await env.KV.list({ prefix: "phone:" });
-  const rows = [["id", "phone", "username", "first_name", "last_name", "ts_iso"]];
+  const rows = [["id","phone","username","first_name","last_name","ts_iso"]];
   for (const { name } of list.keys) {
     const id = name.replace("phone:", "");
     const phone = await env.KV.get(name);
@@ -239,17 +233,13 @@ async function handleMessage(update, env) {
   // مسیرها
   if (text === KB.home) return send(env, chatId, "صفحهٔ اول.", { reply_markup: REPLY_KB });
   if (text === KB.help || text === "/help")
-    return send(
-      env,
-      chatId,
+    return send(env, chatId,
       "راهنما:\n• محصولات → سفارش با Reply\n• پیام به ادمین با Reply\n• ارسال شماره من\n• /menu برای نمایش منو",
       { reply_markup: REPLY_KB }
     );
   if (text === KB.products) return showProducts(env, chatId);
   if (text === KB.account || text === "/whoami")
-    return send(
-      env,
-      chatId,
+    return send(env, chatId,
       `👤 حساب شما:\nID: ${from.id}\nنام: ${(from.first_name || "") + " " + (from.last_name || "")}`.trim(),
       { reply_markup: REPLY_KB }
     );
@@ -293,27 +283,24 @@ async function handleMessage(update, env) {
   await send(env, chatId, `Echo: ${text}`, { reply_markup: REPLY_KB });
 }
 
+// ——— Router
 async function handleUpdate(update, env) {
   try {
     if (update?.callback_query) return handleCallback(update, env);
     return handleMessage(update, env);
-  } catch (e) {
-    console.error("handleUpdate error:", e);
-  }
+  } catch (e) { console.error("handleUpdate error:", e); }
 }
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ——— /version برای تست سریع
+    // /version برای تست سریع
     if (request.method === "GET" && url.pathname === "/version") {
-      return new Response(JSON.stringify({ ok: true, version: VERSION }), {
-        headers: { "content-type": "application/json" },
-      });
+      return new Response(VERSION, { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
-    // ——— CSV endpoints (قبل از not found)
+    // CSV endpoints (قبل از not found)
     const exportSecret = env.ADMIN_EXPORT_SECRET || env.WH_SECRET;
 
     if (request.method === "GET" && url.pathname === "/export/users.csv") {
@@ -340,9 +327,8 @@ export default {
       });
     }
 
-    // ——— Webhook تلگرام (Fast ACK)
+    // Webhook تلگرام (Fast ACK)
     if (request.method === "POST" && url.pathname === `/webhook/${env.WH_SECRET}`) {
-      // اگر TG_SECRET_TOKEN ست شده، هدر باید بخوره
       const hdr =
         request.headers.get("X-Telegram-Bot-Api-Secret-Token") ||
         request.headers.get("X-Telegram-BOT-API-SECRET-TOKEN") ||
@@ -351,18 +337,17 @@ export default {
         return new Response("forbidden", { status: 403 });
 
       let update = null; try { update = await request.json(); } catch {}
-      ctx.waitUntil(handleUpdate(update, env)); // پردازش در پس‌زمینه
-      return new Response("ok");               // پاسخ فوری
+      ctx.waitUntil(handleUpdate(update, env));
+      return new Response("ok");
     }
 
-    // ——— Health (اختیاری)
+    // Health
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(JSON.stringify({ ok: true, version: VERSION }), {
         headers: { "content-type": "application/json" },
       });
     }
 
-    // ——— سایر مسیرها
     return new Response("not found", { status: 404 });
   },
 };

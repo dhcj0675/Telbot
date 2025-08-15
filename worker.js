@@ -1,10 +1,18 @@
-// worker.js — Telegram bot on Cloudflare Workers
-// v1.3.0 — admin stats + CSV export + RTL-safe comparisons
+// worker.js — Phone Gate + Admin Stats + CSV + Health
+// نسخه: v1.4.0
+// نیازها: BOT_TOKEN (Secret) ، WH_SECRET (Var یا TOML)
+// اختیاری: TG_SECRET_TOKEN (Secret) ، ADMIN_EXPORT_SECRET (Secret)
+// برای CSV و Phone Gate: بایند KV با نام "KV" در wrangler.toml
+//
+// wrangler.toml نمونه برای KV:
+// [[kv_namespaces]]
+// binding = "KV"
+// id = "YOUR_NAMESPACE_ID"
+// preview_id = "YOUR_NAMESPACE_ID"
 
-/************  تنظیمات  ************/
-const ADMINS = [6803856798]; // آیدی عددی ادمین‌ها را اینجا بگذار
+const ADMINS = [6803856798]; // آیدی عددی ادمین‌ها
 
-// لیبل‌ها
+// ——— Labels
 const KB = {
   home: "خانه",
   help: "راهنما",
@@ -18,7 +26,7 @@ const KB = {
   stats: "آمار (ادمین)", // مخصوص ادمین
 };
 
-// کیبوردها
+// ——— Keyboards
 const REPLY_KB_USER = {
   keyboard: [
     [{ text: KB.home }, { text: KB.help }],
@@ -42,71 +50,72 @@ const REPLY_KB_ADMIN = {
   input_field_placeholder: "منوی ادمین",
 };
 
-/************  هلسپرها  ************/
-// حذف کاراکترهای نامرئی RTL/LRM و فاصله‌ها
-const norm = (s = "") => s.replace(/[\u200f\u200e\u200d]/g, "").trim();
+// کیبورد مخصوص درخواست شماره (Phone Gate)
+const REPLY_KB_CONTACT_ONLY = {
+  keyboard: [[{ text: KB.sharePhone, request_contact: true }]],
+  resize_keyboard: true,
+  is_persistent: true,
+  one_time_keyboard: false,
+  input_field_placeholder: "برای شروع، دکمه «ارسال شماره من» را بزن…"
+};
 
 const isAdmin = (id) => ADMINS.includes(id);
+const kbFor = (chatId) => (isAdmin(chatId) ? REPLY_KB_ADMIN : REPLY_KB_USER);
 
-// تماس با API تلگرام
+// نرمال‌سازی متن (حذف کاراکترهای نامرئی RTL/LRM)
+const norm = (s = "") => s.replace(/[\u200f\u200e\u200d]/g, "").trim();
+
+// ——— Telegram helpers
 const tg = async (env, method, payload) => {
   const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payload || {}),
   });
   if (!r.ok) {
-    const t = await r.text();
-    console.error("TG error", method, r.status, t);
-    throw new Error(`tg ${method} ${r.status}`);
+    const t = await r.text().catch(() => "");
+    console.error("TG", method, r.status, t);
   }
-  return r.json();
+  return r.json().catch(() => ({}));
 };
-
-const send = (env, chat_id, text, extra = {}) =>
-  tg(env, "sendMessage", { chat_id, text, ...extra });
-
+const send = (env, chat_id, text, extra = {}) => tg(env, "sendMessage", { chat_id, text, ...extra });
 const answerCallback = (env, id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
 
-async function sendCSVDocument(env, chat_id, filename, csvText, caption = "") {
-  const fd = new FormData();
-  fd.append("chat_id", String(chat_id));
-  fd.append("document", new Blob([csvText], { type: "text/csv; charset=utf-8" }), filename);
-  if (caption) fd.append("caption", caption);
-  const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendDocument`, {
-    method: "POST",
-    body: fd,
-  });
-  if (!r.ok) throw new Error(`sendDocument ${r.status}: ${await r.text()}`);
-}
+const notifyAdminsText = async (env, text) => { for (const a of ADMINS) await send(env, a, text); };
+const notifyAdmins = async (env, from, text, tag = "") => {
+  const who = `${from.first_name||""} ${from.last_name||""}`.trim() || "کاربر";
+  const head = `📥 ${tag?`(${tag}) `:""}از ${who}${from.username?` (@${from.username})`:""}\nID: ${from.id}\n\n`;
+  await notifyAdminsText(env, head + text);
+};
 
-/************  KV هلسپرهای  ************/
+// ——— KV helpers (users/phones/CSV)
 async function trackUserOnce(env, from) {
-  if (!env.KV) return { isNew: false };
-  const k = `user:${from.id}`;
-  const had = await env.KV.get(k);
-  if (!had) {
-    await env.KV.put(k, JSON.stringify({
-      id: from.id,
-      first_name: from.first_name || "",
-      last_name: from.last_name || "",
-      username: from.username || "",
-      ts: Date.now(),
-    }));
-    return { isNew: true };
-  }
-  return { isNew: false };
+  if (!env.KV) return;
+  try {
+    const k = `user:${from.id}`;
+    const had = await env.KV.get(k);
+    if (!had) {
+      await env.KV.put(k, JSON.stringify({
+        id: from.id,
+        username: from.username || "",
+        first_name: from.first_name || "",
+        last_name: from.last_name || "",
+        ts: Date.now(),
+      }));
+    }
+  } catch (e) { console.error("KV trackUserOnce", e); }
 }
-
 const savePhone = (env, id, phone) => env.KV?.put(`phone:${id}`, phone);
+const hasPhone = async (env, id) => env.KV ? !!(await env.KV.get(`phone:${id}`)) : false;
 
 const listUserKeys   = (env) => env.KV.list({ prefix: "user:" });
 const listPhoneKeys  = (env) => env.KV.list({ prefix: "phone:" });
-const getUserCount   = async (env) => (await listUserKeys(env)).keys.length;
-const getPhonesCount = async (env) => (await listPhoneKeys(env)).keys.length;
+const getUserCount   = async (env) => env.KV ? (await listUserKeys(env)).keys.length : 0;
+const getPhonesCount = async (env) => env.KV ? (await listPhoneKeys(env)).keys.length : 0;
 
 async function getLastUsers(env, limit = 10) {
+  if (!env.KV) return [];
   const l = await listUserKeys(env);
   const vals = await Promise.all(l.keys.map(k => env.KV.get(k.name)));
   const arr = vals.map(v => { try { return JSON.parse(v || "{}"); } catch { return null; } })
@@ -119,7 +128,6 @@ async function getLastUsers(env, limit = 10) {
 function csvOfRows(rows) {
   return rows.map(r => r.map(x => `"${String(x ?? "").replace(/"/g,'""')}"`).join(",")).join("\n");
 }
-
 async function buildUsersCSV(env) {
   if (!env.KV) return "id,username,first_name,last_name,ts_iso\n";
   const l = await listUserKeys(env);
@@ -128,17 +136,10 @@ async function buildUsersCSV(env) {
   for (const v of vals) {
     if (!v) continue;
     let o; try { o = JSON.parse(v); } catch { continue; }
-    rows.push([
-      o.id,
-      o.username ? `@${o.username}` : "",
-      o.first_name || "",
-      o.last_name || "",
-      o.ts ? new Date(o.ts).toISOString() : "",
-    ]);
+    rows.push([o.id ?? "", o.username?`@${o.username}`:"", o.first_name||"", o.last_name||"", o.ts?new Date(o.ts).toISOString():""]);
   }
   return csvOfRows(rows);
 }
-
 async function buildPhonesCSV(env) {
   if (!env.KV) return "id,phone,username,first_name,last_name,ts_iso\n";
   const l = await listPhoneKeys(env);
@@ -146,185 +147,191 @@ async function buildPhonesCSV(env) {
   for (const { name } of l.keys) {
     const id = name.replace("phone:","");
     const phone = await env.KV.get(name);
-    let u = {};
-    try { u = JSON.parse(await env.KV.get(`user:${id}`) || "{}"); } catch {}
-    rows.push([
-      id,
-      phone || "",
-      u.username ? `@${u.username}` : "",
-      u.first_name || "",
-      u.last_name || "",
-      u.ts ? new Date(u.ts).toISOString() : "",
-    ]);
+    let u = {}; try { u = JSON.parse((await env.KV.get(`user:${id}`)) || "{}"); } catch {}
+    rows.push([id, phone||"", u.username?`@${u.username}`:"", u.first_name||"", u.last_name||"", u.ts?new Date(u.ts).toISOString():""]);
   }
   return csvOfRows(rows);
 }
 
-/************  پردازش آپدیت  ************/
-function parseCommand(text = "", botUsername = "") {
-  if (!text || !text.startsWith("/")) return { cmd:null, args:[] };
-  const [f, ...rest] = text.trim().split(/\s+/);
-  const [raw, at] = f.split("@");
-  if (at && botUsername && at.toLowerCase() !== botUsername.toLowerCase()) return { cmd:null, args:[] };
-  return { cmd: raw.slice(1).toLowerCase(), args: rest };
+// ارسال CSV به‌صورت فایل تلگرامی
+async function sendCSVDocument(env, chat_id, filename, csvText, caption = "") {
+  const fd = new FormData();
+  fd.append("chat_id", String(chat_id));
+  fd.append("document", new Blob([csvText], { type: "text/csv; charset=utf-8" }), filename);
+  if (caption) fd.append("caption", caption);
+  const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendDocument`, { method: "POST", body: fd });
+  if (!r.ok) throw new Error(`sendDocument ${r.status}: ${await r.text()}`);
 }
 
-async function notifyAdmins(env, from, text, tag = "") {
-  const who = `${from.first_name||""} ${from.last_name||""}`.trim() || "کاربر";
-  const head = `📥 ${tag?`(${tag}) `:""}از ${who}${from.username?` (@${from.username})`:""}\nID: ${from.id}\n\n`;
-  for (const aid of ADMINS) { try { await send(env, aid, head + text); } catch(e){ console.error("notify", e);} }
-}
+// ——— Core handlers
+async function handleMessage(update, env) {
+  const msg = update.message || update.edited_message;
+  if (!msg) return;
 
-async function handleUpdate(update, env) {
-  try {
-    // Callback queries (اگر داشتی)
-    if (update?.callback_query) {
-      const cq = update.callback_query;
-      await answerCallback(env, cq.id);
-      return;
-    }
+  const chatId = msg.chat.id;
+  const from   = msg.from || {};
+  const raw    = msg.text || "";
+  const text   = norm(raw);
 
-    // Messages
-    const msg = update && (update.message || update.edited_message);
-    if (!msg) return;
+  // ثبت یک‌بار کاربر
+  trackUserOnce(env, from);
 
-    const chatId = msg.chat.id;
-    const from = msg.from || {};
-    const text = msg.text || "";
-    const ntext = norm(text); // متن نرمال‌شده برای مقایسه
-    const kb = isAdmin(chatId) ? REPLY_KB_ADMIN : REPLY_KB_USER;
-
-    // ثبت یکبارِ کاربر
-    await trackUserOnce(env, from);
-
-    // دریافت شماره (بدون اعلان به کاربر)
+  // ======= Phone Gate: غیرادمین‌ها تا شماره ندهند، منو ندارند =======
+  if (!isAdmin(from.id) && env.KV) {
+    // اگر همین الآن شماره فرستاد
     if (msg.contact && msg.contact.user_id === from.id) {
       const phone = msg.contact.phone_number;
       await savePhone(env, from.id, phone);
       await notifyAdmins(env, from, `شماره کاربر: ${phone}`, "phone");
+      await send(env, chatId, "✅ شماره‌ات ثبت شد. خوش آمدی! منو فعال شد.", { reply_markup: kbFor(chatId) });
       return;
     }
 
-    // getMe برای تشخیص /start@username
-    let me = { result: { username: "" } };
-    try { me = await tg(env, "getMe", {}); } catch {}
-    const { cmd } = parseCommand(ntext, me.result.username);
-
-    // /start
-    if (cmd === "start") {
-      await send(env, chatId, "سلام! به بات خوش آمدی. از دکمه‌های پایین استفاده کن.", { reply_markup: kb });
+    // اگر هنوز شماره ثبت نشده
+    const ok = await hasPhone(env, from.id);
+    if (!ok) {
+      await send(env, chatId, "برای شروع کار با ربات، لطفاً با دکمه زیر شماره‌ات را بفرست.", { reply_markup: REPLY_KB_CONTACT_ONLY });
       return;
     }
-
-    // منوها
-    if (ntext === norm(KB.home)) {
-      await send(env, chatId, "بازگشت به صفحه اول.", { reply_markup: kb });
-
-    } else if (ntext === norm(KB.help) || cmd === "help") {
-      await send(env, chatId,
-        "راهنما:\n• محصولات\n• پیام به ادمین (با Reply)\n• ارسال شماره من\n• حساب/پینگ/زمان/من کیم\n" +
-        (isAdmin(chatId) ? "• آمار (ادمین) و CSV" : ""), { reply_markup: kb });
-
-    } else if (ntext === norm(KB.products)) {
-      await send(env, chatId, "لیست محصولات به‌زودی…", { reply_markup: kb });
-
-    } else if (ntext === norm(KB.account) || cmd === "whoami") {
-      await send(env, chatId, `👤 حساب شما:\nID: ${from.id}\nنام: ${(from.first_name||"") + " " + (from.last_name||"")}`.trim(), { reply_markup: kb });
-
-    } else if (ntext === norm(KB.ping) || cmd === "ping") {
-      await send(env, chatId, "pong", { reply_markup: kb });
-
-    } else if (ntext === norm(KB.time) || cmd === "time") {
-      await send(env, chatId, `⏰ ${new Date().toISOString()}`, { reply_markup: kb });
-
-    } else if (ntext === norm(KB.whoami)) {
-      await send(env, chatId, `ID: ${from.id}`, { reply_markup: kb });
-
-    } else if (
-      // آمار: با دکمه، با تایپ "stats"، یا هر متنی که با «آمار» شروع شود
-      (isAdmin(from.id)) &&
-      (ntext === norm(KB.stats) || ntext.toLowerCase() === "stats" || cmd === "stats" || ntext.startsWith("آمار"))
-    ) {
-      if (!env.KV) {
-        await send(env, chatId, "KV وصل نیست.", { reply_markup: kb });
-      } else {
-        const users  = await getUserCount(env);
-        const phones = await getPhonesCount(env);
-        const last   = await getLastUsers(env, 10);
-        const lines  = last.map((u,i)=>{
-          const name = `${u.first_name||""} ${u.last_name||""}`.trim() || "کاربر";
-          const un   = u.username?` @${u.username}`:"";
-          const t    = u.ts?new Date(u.ts).toISOString():"";
-          return `${i+1}. ${name}${un} | ID: ${u.id} | ${t}`;
-        }).join("\n") || "—";
-
-        await send(env, chatId,
-          `📊 آمار:\nکاربر یکتا: ${users}\nشماره ثبت‌شده: ${phones}\n\nآخرین ۱۰ کاربر:\n${lines}`,
-          { reply_markup: kb }
-        );
-
-        // ارسال CSV ها به‌صورت فایل
-        try {
-          const csvUsers  = await buildUsersCSV(env);
-          await sendCSVDocument(env, chatId, "users.csv", csvUsers, "CSV کاربران");
-
-          const csvPhones = await buildPhonesCSV(env);
-          await sendCSVDocument(env, chatId, "phones.csv", csvPhones, "CSV شماره‌ها");
-        } catch (e) {
-          console.error("CSV send error:", e);
-          await send(env, chatId, "ارسال CSV با خطا مواجه شد.", { reply_markup: kb });
-        }
-      }
-
-    } else if (ntext === norm(KB.contact)) {
-      // پیام به ادمین (بدون نمایش «ارسال شد» به کاربر)
-      await send(env, chatId, "##ADMIN## لطفاً پیام‌تان را به‌صورت Reply به همین پیام بفرستید.", {
-        reply_markup: { force_reply: true, selective: true },
-      });
-
-    } else {
-      // اگر کاربر روی پیام راهنما Reply کرد، به ادمین فوروارد کن (بی‌صدا)
-      const repliedText = msg.reply_to_message?.text || "";
-      if (repliedText && (repliedText.includes("##ADMIN##") || repliedText.includes("##ADMIN:"))) {
-        if (ntext) await notifyAdmins(env, from, ntext, "contact");
-        return;
-      }
-
-      // eco
-      await send(env, chatId, text || "پیام متنی نفرستادی 🙂", { reply_markup: kb });
-    }
-  } catch (e) {
-    console.error("handleUpdate error:", e);
   }
+  // ======= پایان Phone Gate =======
+
+  const kb = kbFor(chatId);
+
+  // دریافت شماره (بعد از عبور از گیت هم بماند)
+  if (msg.contact && msg.contact.user_id === from.id) {
+    const phone = msg.contact.phone_number;
+    await savePhone(env, from.id, phone);
+    await notifyAdmins(env, from, `شماره کاربر: ${phone}`, "phone");
+    await send(env, chatId, "شماره‌ات دریافت شد ✅", { reply_markup: kb });
+    return;
+  }
+
+  // دستورات پایه
+  if (text === "/start") {
+    await send(env, chatId, "سلام! ربات فعّاله ✅", { reply_markup: kb });
+    return;
+  }
+  if (text === "/menu") {
+    await send(env, chatId, "منو باز شد ✅", { reply_markup: kb });
+    return;
+  }
+
+  // آمار (ادمین)
+  if (isAdmin(from.id) && (text === KB.stats || text === "/stats" || text.toLowerCase() === "stats" || text.startsWith("آمار"))) {
+    if (!env.KV) {
+      await send(env, chatId, "KV وصل نیست.", { reply_markup: kb });
+    } else {
+      const users  = await getUserCount(env);
+      const phones = await getPhonesCount(env);
+      const last   = await getLastUsers(env, 10);
+      const lines  = last.map((u,i)=>{
+        const name = `${u.first_name||""} ${u.last_name||""}`.trim() || "کاربر";
+        const un   = u.username?` @${u.username}`:"";
+        const t    = u.ts?new Date(u.ts).toISOString():"";
+        return `${i+1}. ${name}${un} | ID: ${u.id} | ${t}`;
+      }).join("\n") || "—";
+
+      await send(env, chatId, `📊 آمار:\nکاربر یکتا: ${users}\nشماره ثبت‌شده: ${phones}\n\nآخرین ۱۰ کاربر:\n${lines}`, { reply_markup: kb });
+
+      // ارسال CSV‌ها به‌صورت فایل
+      try {
+        const csvU = await buildUsersCSV(env);
+        await sendCSVDocument(env, chatId, "users.csv", csvU, "CSV کاربران");
+        const csvP = await buildPhonesCSV(env);
+        await sendCSVDocument(env, chatId, "phones.csv", csvP, "CSV شماره‌ها");
+      } catch (e) {
+        console.error("CSV send error:", e);
+        await send(env, chatId, "ارسال CSV با خطا مواجه شد.", { reply_markup: kb });
+      }
+    }
+    return;
+  }
+
+  // منوها
+  if (text === KB.home)   return send(env, chatId, "صفحهٔ اول.", { reply_markup: kb });
+  if (text === KB.help)   return send(env, chatId, "راهنما:\n• محصولات\n• پیام به ادمین (Reply)\n• ارسال شماره من\n• /menu", { reply_markup: kb });
+  if (text === KB.products) return send(env, chatId, "لیست محصولات به‌زودی…", { reply_markup: kb });
+  if (text === KB.account || text === "/whoami")
+    return send(env, chatId, `👤 حساب شما:\nID: ${from.id}\nنام: ${(from.first_name||"") + " " + (from.last_name||"")}`.trim(), { reply_markup: kb });
+  if (text === KB.ping || text === "/ping") return send(env, chatId, "pong 🏓", { reply_markup: kb });
+  if (text === KB.time || text === "/time") return send(env, chatId, `⏰ ${new Date().toISOString()}`, { reply_markup: kb });
+  if (text === KB.whoami) return send(env, chatId, `ID: ${from.id}`, { reply_markup: kb });
+
+  // پیام به ادمین (با Reply)
+  if (text === KB.contact) {
+    await send(env, chatId, "##ADMIN## لطفاً پیام‌تان را به صورت Reply به همین پیام بفرستید.", {
+      reply_markup: { force_reply: true, selective: true }
+    });
+    return;
+  }
+  const repliedText = msg.reply_to_message?.text || "";
+  if (repliedText && repliedText.includes("##ADMIN##")) {
+    if (text) await notifyAdmins(env, from, text, "contact");
+    await send(env, chatId, "پیامت ارسال شد ✅", { reply_markup: kb });
+    return;
+  }
+
+  // پیش‌فرض: Echo
+  await send(env, chatId, `Echo: ${raw}`, { reply_markup: kb });
 }
 
-/************  Worker  ************/
+async function handleUpdate(update, env) {
+  try {
+    if (update?.callback_query) {
+      await answerCallback(env, update.callback_query.id);
+      return;
+    }
+    return handleMessage(update, env);
+  } catch (e) { console.error("handleUpdate error:", e); }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // سلامت
+    // Health (نسخه روی / نشان داده می‌شود)
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(JSON.stringify({ ok: true, ver: "1.3.0" }), {
-        headers: { "content-type": "application/json" },
+      return new Response(JSON.stringify({ ok: true, ver: "v1.4.0" }), {
+        headers: { "content-type": "application/json" }
       });
     }
 
-    // وبهوک
-    if (request.method === "POST" && url.pathname === `/webhook/${env.WH_SECRET}`) {
-      // بررسی tg secret token اگر ست شده باشد
-      const hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-              || request.headers.get("X-Telegram-BOT-API-SECRET-TOKEN");
-      if (env.TG_SECRET_TOKEN && hdr !== env.TG_SECRET_TOKEN) {
-        return new Response("forbidden", { status: 403 });
-      }
+    // CSV endpoints (اختیاری: اگر فقط لینک دانلود از بیرون هم می‌خواهی)
+    const exportSecret = env.ADMIN_EXPORT_SECRET || env.WH_SECRET;
+    if (request.method === "GET" && url.pathname === "/export/users.csv") {
+      if (!exportSecret || url.searchParams.get("secret") !== exportSecret) return new Response("forbidden", { status: 403 });
+      const csv = await buildUsersCSV(env);
+      return new Response(csv, {
+        headers: {
+          "content-type": "text/csv; charset=utf-8",
+          "content-disposition": 'attachment; filename="users.csv"'
+        }
+      });
+    }
+    if (request.method === "GET" && url.pathname === "/export/phones.csv") {
+      if (!exportSecret || url.searchParams.get("secret") !== exportSecret) return new Response("forbidden", { status: 403 });
+      const csv = await buildPhonesCSV(env);
+      return new Response(csv, {
+        headers: {
+          "content-type": "text/csv; charset=utf-8",
+          "content-disposition": 'attachment; filename="phones.csv"'
+        }
+      });
+    }
 
-      let update = null;
-      try { update = await request.json(); } catch {}
-      ctx.waitUntil(handleUpdate(update, env)); // پردازش پس‌زمینه
-      return new Response("ok");               // ACK سریع
+    // Webhook (Fast ACK + Secret header)
+    if (request.method === "POST" && url.pathname === `/webhook/${env.WH_SECRET}`) {
+      const hdr =
+        request.headers.get("X-Telegram-Bot-Api-Secret-Token") ||
+        request.headers.get("X-Telegram-BOT-API-SECRET-TOKEN") || "";
+      if (env.TG_SECRET_TOKEN && hdr !== env.TG_SECRET_TOKEN) return new Response("forbidden", { status: 403 });
+
+      let update = null; try { update = await request.json(); } catch {}
+      ctx.waitUntil(handleUpdate(update, env));
+      return new Response("ok");
     }
 
     return new Response("not found", { status: 404 });
-  },
+  }
 };

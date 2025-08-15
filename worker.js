@@ -1,19 +1,9 @@
-// worker.js — KV Cursor Pagination (Newest-first) + Phone Gate + Admin Panel + CSV
-// نسخه: v1.9.0
-//
-// Env Vars/Secrets لازم:
-//   BOT_TOKEN (Secret) — الزامی
-//   WH_SECRET (Text/vars) — الزامی
-//   TG_SECRET_TOKEN (Secret) — اختیاری
-//
-// نیاز به KV با بایند "KV":
-// [[kv_namespaces]]
-// binding = "KV"
-// id = "YOUR_NAMESPACE_ID"
-// preview_id = "YOUR_NAMESPACE_ID"
+// worker.js — KV Cursor Pagination + Pretty Admin Stats (+ phone) + Admin Panel + Phone Gate (ساده)
+// نسخه: v2.0.0
 
-const ADMINS = [6803856798];  // آیدی عددی ادمین‌ها
-const PAGE_SIZE = 20;         // تعداد ردیف در هر صفحه
+/************ تنظیمات ************/
+const ADMINS = [6803856798];   // آی‌دی عددی ادمین‌ها
+const PAGE_SIZE = 50;          // تعداد ردیف در هر صفحه آمار
 
 /************ لیبل‌ها و کیبوردها ************/
 const KB = {
@@ -78,17 +68,20 @@ const tg = async (env, method, payload) => {
 const send = (env, chat_id, text, extra = {}) => tg(env, "sendMessage", { chat_id, text, ...extra });
 const answerCallback = (env, id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
+const editMessage = (env, chat_id, message_id, text, extra = {}) =>
+  tg(env, "editMessageText", { chat_id, message_id, text, ...extra });
 
 /************ KV keys ************/
 const userKey   = (id) => `user:${id}`;
 const phoneKey  = (id) => `phone:${id}`;
 const wlKey     = (id) => `wl:${id}`;
-// ایندکس زمانی برای صفحه‌خوانی: ui:<invTs>:<id>  (invTs = 9999999999999 - ts)
+// ایندکس زمانی: ui:<invTs>:<id>  (invTs = 9999999999999 - ts) → مرتب جدیدترین→قدیمی‌ترین
 const uiKey     = (invTs, id) => `ui:${invTs}:${id}`;
 const uiPrefix  = "ui:";
 
-// استک cursor برای هر ادمین (برای برگشت به صفحه قبلی)
-const stackKey  = (adminId) => `uistack:${adminId}`; // JSON array از cursorها با TTL
+// استک cursor برای هر ادمین (برای Prev)
+const stackKey  = (adminId) => `uistack:${adminId}`; // JSON array از cursorها
+const nextKey   = (adminId) => `uinext:${adminId}`;   // آخرین nextCursor
 
 /************ KV helpers (users/phones/whitelist/index) ************/
 async function trackUserOnce(env, from) {
@@ -105,17 +98,14 @@ async function trackUserOnce(env, from) {
         last_name: from.last_name || "",
         ts: now,
       }));
-      // ایندکس بر اساس زمان (جدید به قدیم)
       const inv = (9999999999999 - now).toString().padStart(13, "0");
       await env.KV.put(uiKey(inv, from.id), "1");
-    } else {
-      // اگر خواستی ایندکس را به‌روزرسانی کنی (مثلاً هر بار /start)، می‌تونی حذف/ایجاد کنی.
-      // برای سادگی، فقط اولین ثبت را ایندکس می‌کنیم.
     }
   } catch (e) { console.error("KV trackUserOnce", e); }
 }
 
 const savePhone       = (env, id, phone) => env.KV?.put(phoneKey(id), phone);
+const getPhone        = (env, id) => env.KV ? env.KV.get(phoneKey(id)) : Promise.resolve(null);
 const hasPhone        = async (env, id) => env.KV ? !!(await env.KV.get(phoneKey(id))) : false;
 
 const isWhitelistedKV = async (env, id) => env.KV ? !!(await env.KV.get(wlKey(id))) : false;
@@ -129,14 +119,13 @@ async function getCounts(env) {
   return { users: usersList.keys.length, phones: phonesList.keys.length };
 }
 
-/************ Cursor stack per-admin (برای Prev) ************/
+/************ Cursor stack per-admin ************/
 async function pushCursor(env, adminId, cursor) {
   if (!env.KV) return;
   const key = stackKey(adminId);
   let arr = [];
   try { arr = JSON.parse(await env.KV.get(key) || "[]"); } catch {}
   arr.push(cursor);
-  // TTL کوتاه تا دیتای موقت بمونه
   await env.KV.put(key, JSON.stringify(arr.slice(-50)), { expirationTtl: 3600 });
 }
 async function popCursor(env, adminId) {
@@ -152,13 +141,21 @@ async function clearStack(env, adminId) {
   if (!env.KV) return;
   await env.KV.delete(stackKey(adminId));
 }
+async function currentIndexFromStack(env, adminId) {
+  if (!env.KV) return 0;
+  try { const arr = JSON.parse(await env.KV.get(stackKey(adminId)) || "[]"); return Math.max(0, arr.length) * PAGE_SIZE; }
+  catch { return 0; }
+}
+async function stackHasPrev(env, adminId) {
+  if (!env.KV) return false;
+  try { const arr = JSON.parse(await env.KV.get(stackKey(adminId)) || "[]"); return arr.length > 0; }
+  catch { return false; }
+}
 
 /************ صفحه‌خوانی ایندکس‌شده ************/
-// برمی‌گرداند: { items: Array<{id, userObj|null}>, nextCursor, complete }
 async function pageUsersByIndex(env, cursor = undefined, limit = PAGE_SIZE) {
   if (!env.KV) return { items: [], nextCursor: null, complete: true };
   const resp = await env.KV.list({ prefix: uiPrefix, cursor, limit });
-  // هر key مثل ui:INVTS:ID → ID را بکش بیرون و user را بخوان
   const items = [];
   for (const k of resp.keys) {
     const parts = k.name.split(":"); // ["ui", invTs, id]
@@ -170,13 +167,12 @@ async function pageUsersByIndex(env, cursor = undefined, limit = PAGE_SIZE) {
   return { items, nextCursor: resp.cursor || null, complete: !!resp.list_complete };
 }
 
-/************ CSV ************/
+/************ CSV (همانند قبل) ************/
 function csvOfRows(rows) {
   return rows.map(r => r.map(x => `"${String(x ?? "").replace(/"/g,'""')}"`).join(",")).join("\n");
 }
 async function buildUsersCSV(env) {
   if (!env.KV) return "id,username,first_name,last_name,ts_iso\n";
-  // اگر دیتا زیاد است، بهتر است با cursor از ui: پیمایش کنیم
   let cursor = undefined;
   const rows = [["id","username","first_name","last_name","ts_iso"]];
   while (true) {
@@ -227,67 +223,78 @@ async function showAdminPanel(env, chatId) {
         [{ text: "📊 آمار (صفحه‌بندی)", callback_data: "admin:stats:start" }],
         [{ text: "⬇️ CSV کاربران", callback_data: "admin:csv_users" },
          { text: "⬇️ CSV شماره‌ها", callback_data: "admin:csv_phones" }],
-        [{ text: "📋 استارت‌زده‌ها بدون شماره", callback_data: "admin:pending" }],
-        [{ text: "📝 لیست وایت‌لیست", callback_data: "admin:listwhite" }],
-        [{ text: "➕ افزودن با آی‌دی", callback_data: "admin:add_prompt" },
-         { text: "🗑️ حذف با آی‌دی",  callback_data: "admin:del_prompt" }],
       ],
     },
   });
 }
 
+/************ Formatting helpers ************/
+const escapeHTML = (s = "") =>
+  String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const pad = (s, len) => {
+  s = String(s ?? "");
+  if (s.length >= len) return s.slice(0, len);
+  return s + " ".repeat(len - s.length);
+};
+
+/************ رندر صفحه آمار (جدول زیبا + cursor) ************/
 async function renderStatsPage(env, adminId, chatId, cursor = undefined) {
   const { users, phones } = await getCounts(env);
   const { items, nextCursor, complete } = await pageUsersByIndex(env, cursor, PAGE_SIZE);
 
-  const startIdx = await currentIndexFromStack(env, adminId); // فقط برای نمایش بازه
+  const startIdx = await currentIndexFromStack(env, adminId);
   const start = startIdx + 1;
   const end   = startIdx + items.length;
 
-  const lines = items.map((it, i) => {
-    const u = it.user || {};
+  const header =
+    pad("#", 4) + " | " +
+    pad("ID", 11) + " | " +
+    pad("Name", 22) + " | " +
+    pad("@user", 18) + " | " +
+    pad("📞 Phone", 16) + " | " +
+    pad("Time(ISO)", 20);
+
+  const lines = [header, "-".repeat(header.length)];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const u  = it.user || {};
+    const uid = u.id || it.id;
     const idx = startIdx + i + 1;
     const name = `${u.first_name||""} ${u.last_name||""}`.trim() || "کاربر";
-    const un = u.username ? ` @${u.username}` : "";
-    const t = u.ts ? new Date(u.ts).toISOString() : "";
-    return `${idx}. ${name}${un} | ID: ${u.id || it.id} | ${t}`;
-  }).join("\n") || "—";
+    const un   = u.username ? `@${u.username}` : "";
+    const ts   = u.ts ? new Date(u.ts).toISOString() : "";
+    const ph   = await getPhone(env, uid) || "";
 
-  // دکمه‌ها: قبلی/بعدی. برای قبلی از استک استفاده می‌کنیم، برای بعدی cursor جدید را push می‌کنیم.
+    const row =
+      pad(idx, 4) + " | " +
+      pad(uid, 11) + " | " +
+      pad(name, 22) + " | " +
+      pad(un, 18) + " | " +
+      pad(ph || "—", 16) + " | " +
+      pad(ts, 20);
+    lines.push(row);
+  }
+
+  const table  = `<pre>${escapeHTML(lines.join("\n"))}</pre>`;
+  const footer = `نمایش ${start}-${end}${complete ? "" : " …"} | کل کاربران: ${users} | شماره‌ها: ${phones}`;
+
   const buttons = [];
   const prevExists = await stackHasPrev(env, adminId);
   if (prevExists) buttons.push({ text: "« قبلی", callback_data: "admin:stats:prev" });
-  buttons.push({ text: `${start}-${end}${complete ? "" : " …"}`, callback_data: "noop" });
+  buttons.push({ text: `${start}-${end}`, callback_data: "noop" });
   if (!complete && nextCursor) buttons.push({ text: "بعدی »", callback_data: "admin:stats:next" });
 
-  // اگر nextCursor داریم، موقتاً نگه داریم تا روی "next" استفاده کنیم
-  if (nextCursor) {
-    await env.KV.put(`uinext:${adminId}`, nextCursor, { expirationTtl: 600 });
-  } else {
-    await env.KV.delete(`uinext:${adminId}`);
-  }
+  // ذخیرهٔ nextCursor برای next
+  if (nextCursor) await env.KV.put(nextKey(adminId), nextCursor, { expirationTtl: 600 });
+  else await env.KV.delete(nextKey(adminId));
 
   await tg(env, "sendMessage", {
     chat_id: chatId,
-    text: `📊 آمار (جدیدترین‌ها):\nکاربر یکتا: ${users}\nشماره ثبت‌شده: ${phones}\n\n${lines}`,
+    text: `${table}\n<b>${escapeHTML(footer)}</b>`,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
     reply_markup: { inline_keyboard: [buttons, [{ text: "↩️ برگشت به پنل", callback_data: "admin:panel" }]] },
   });
-}
-
-// استک اندیس برای نمایش (هر صفحه PAGE_SIZE ردیف جلو می‌رویم)
-async function currentIndexFromStack(env, adminId) {
-  if (!env.KV) return 0;
-  try {
-    const arr = JSON.parse(await env.KV.get(stackKey(adminId)) || "[]");
-    return Math.max(0, arr.length) * PAGE_SIZE;
-  } catch { return 0; }
-}
-async function stackHasPrev(env, adminId) {
-  if (!env.KV) return false;
-  try {
-    const arr = JSON.parse(await env.KV.get(stackKey(adminId)) || "[]");
-    return arr.length > 0;
-  } catch { return false; }
 }
 
 /************ Callbacks ************/
@@ -298,43 +305,47 @@ async function handleCallback(update, env) {
 
   if (!isAdmin(chatId)) { await answerCallback(env, cq.id, "فقط برای ادمین.", true); return; }
 
-  // برگشت به پنل
   if (data === "admin:panel") {
     await answerCallback(env, cq.id);
     await showAdminPanel(env, chatId);
     return;
   }
 
-  // آمار (صفحه‌بندی با cursor)
+  // آمار: شروع
   if (data === "admin:stats:start") {
     await answerCallback(env, cq.id);
-    await clearStack(env, chatId);                // شروع تازه
-    await renderStatsPage(env, chatId, chatId);   // adminId = chatId (چت خصوصی ادمین)
+    await clearStack(env, chatId);
+    // صفحه اول: cursor undefined
+    await renderStatsPage(env, chatId, chatId, undefined);
     return;
   }
+
+  // آمار: بعدی
   if (data === "admin:stats:next") {
     await answerCallback(env, cq.id);
-    const next = await env.KV.get(`uinext:${chatId}`);
+    const next = await env.KV.get(nextKey(chatId));
     if (next) {
-      await pushCursor(env, chatId, next);        // برای برگشت، این cursor را استک می‌کنیم
+      await pushCursor(env, chatId, next);
       await renderStatsPage(env, chatId, chatId, next);
     } else {
       await send(env, chatId, "صفحه بعدی موجود نیست.");
     }
     return;
   }
+
+  // آمار: قبلی
   if (data === "admin:stats:prev") {
     await answerCallback(env, cq.id);
-    // برای prev: یک مرحله از استک برگردیم عقب
-    const _discard = await popCursor(env, chatId); // صفحه فعلی را کنار بگذار
-    const prev = await popCursor(env, chatId);     // cursor صفحه‌ی قبل
+    // صفحه فعلی را کنار بگذار، برگرد به قبل‌تر
+    const _discard = await popCursor(env, chatId);
+    const prev = await popCursor(env, chatId);
     if (prev) {
-      // چون pop کردیم، باید دوباره prev را push کنیم تا در index درست بمانیم
+      // چون یکی اضافه برداشتیم، prev را دوباره push کنیم تا شاخص درست بماند
       await pushCursor(env, chatId, prev);
       await renderStatsPage(env, chatId, chatId, prev);
     } else {
       await clearStack(env, chatId);
-      await renderStatsPage(env, chatId, chatId, undefined); // برگرد به اول
+      await renderStatsPage(env, chatId, chatId, undefined);
     }
     return;
   }
@@ -353,80 +364,6 @@ async function handleCallback(update, env) {
     return;
   }
 
-  // Pending: آخرین استارت‌زده‌ها بدون شماره (۲۰ تا)
-  if (data === "admin:pending") {
-    await answerCallback(env, cq.id);
-    if (!env.KV) { await send(env, chatId, "KV وصل نیست."); return; }
-    const pending = [];
-    // از ایندکس (جدید به قدیم) صفحه‌خوانی کوتاه
-    let cursor = undefined;
-    while (pending.length < 20) {
-      const { items, nextCursor, complete } = await pageUsersByIndex(env, cursor, 100);
-      for (const it of items) {
-        const has = await env.KV.get(phoneKey(it.id));
-        if (!has) pending.push(it.user || { id: it.id });
-        if (pending.length >= 20) break;
-      }
-      if (pending.length >= 20 || complete || !nextCursor) break;
-      cursor = nextCursor;
-    }
-    if (!pending.length) { await send(env, chatId, "🚀 کاربر بدون شماره در لیست اخیر نداریم."); return; }
-    const lines = pending.map((u,i)=>{
-      const name = `${u.first_name||""} ${u.last_name||""}`.trim() || "کاربر";
-      const un = u.username ? ` @${u.username}` : "";
-      return `${i+1}. ${name}${un} | ID: ${u.id}`;
-    }).join("\n");
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text: `آخرین استارت‌زده‌ها بدون شماره:\n\n${lines}\n\nروی دکمه‌ها کلیک کن:`,
-      reply_markup: {
-        inline_keyboard: pending.map(u => ([
-          { text: `➕ WL ${u.id}`, callback_data: `wl_add:${u.id}` }
-        ]))
-      }
-    });
-    return;
-  }
-
-  // لیست وایت‌لیست
-  if (data === "admin:listwhite") {
-    await answerCallback(env, cq.id);
-    const l = await env.KV.list({ prefix: "wl:" });
-    const ids = l.keys.map(k => k.name.slice(3));
-    await send(env, chatId, ids.length ? `Whitelist:\n${ids.join("\n")}` : "وایت‌لیست خالی است.");
-    return;
-  }
-
-  // افزودن/حذف با آی‌دی (Prompt)
-  if (data === "admin:add_prompt") {
-    await answerCallback(env, cq.id);
-    await send(env, chatId, "##ADMIN:ADDWL##\nآی‌دی عددی کاربر را ریپلای کنید.", {
-      reply_markup: { force_reply: true, selective: true },
-    });
-    return;
-  }
-  if (data === "admin:del_prompt") {
-    await answerCallback(env, cq.id);
-    await send(env, chatId, "##ADMIN:DELWL##\nآی‌دی عددی کاربر را ریپلای کنید.", {
-      reply_markup: { force_reply: true, selective: true },
-    });
-    return;
-  }
-
-  // دکمه‌های WL
-  if (data.startsWith("wl_add:")) {
-    const uid = parseInt(data.split(":")[1], 10);
-    if (uid) { await addWhitelistKV(env, uid); await answerCallback(env, cq.id, `Added WL: ${uid}`); await send(env, chatId, `✅ کاربر ${uid} به وایت‌لیست اضافه شد.`); }
-    else { await answerCallback(env, cq.id, "ID نامعتبر", true); }
-    return;
-  }
-  if (data.startsWith("wl_del:")) {
-    const uid = parseInt(data.split(":")[1], 10);
-    if (uid) { await delWhitelistKV(env, uid); await answerCallback(env, cq.id, `Removed WL: ${uid}`); await send(env, chatId, `🗑️ کاربر ${uid} از وایت‌لیست حذف شد.`); }
-    else { await answerCallback(env, cq.id, "ID نامعتبر", true); }
-    return;
-  }
-
   await answerCallback(env, cq.id);
 }
 
@@ -441,7 +378,7 @@ async function handleMessage(update, env) {
   const text   = norm(raw);
   const kb     = kbFor(chatId);
 
-  // ثبت یک‌بار کاربر + ایندکس
+  // ثبت کاربر + ایندکس
   await trackUserOnce(env, from);
 
   // دریافت شماره
@@ -452,7 +389,7 @@ async function handleMessage(update, env) {
     return;
   }
 
-  // Phone Gate
+  // Phone Gate (ساده: اینجا می‌تونی وایت‌لیست هم اضافه کنی اگر خواستی)
   if (!isAdmin(from.id) && env.KV) {
     const white = await isWhitelistedKV(env, from.id);
     if (!white) {
@@ -483,29 +420,13 @@ async function handleMessage(update, env) {
     return;
   }
 
-  // پاسخ به ریپلای‌های افزودن/حذف دستی WL
-  const repliedText = msg.reply_to_message?.text || "";
-  if (isAdmin(from.id) && repliedText.includes("##ADMIN:ADDWL##")) {
-    const uid = parseInt(text, 10);
-    if (!uid) { await send(env, chatId, "آی‌دی نامعتبر است. فقط عدد بفرست."); return; }
-    await addWhitelistKV(env, uid);
-    await send(env, chatId, `✅ کاربر ${uid} به وایت‌لیست اضافه شد.`);
-    return;
-  }
-  if (isAdmin(from.id) && repliedText.includes("##ADMIN:DELWL##")) {
-    const uid = parseInt(text, 10);
-    if (!uid) { await send(env, chatId, "آی‌دی نامعتبر است. فقط عدد بفرست."); return; }
-    await delWhitelistKV(env, uid);
-    await send(env, chatId, `🗑️ کاربر ${uid} از وایت‌لیست حذف شد.`);
-    return;
-  }
-
-  // پیام به ادمین
+  // پیام به ادمین (ساده)
   if (text === KB.contact) {
     await send(env, chatId, "##ADMIN## لطفاً پیام‌تان را به صورت Reply به همین پیام بفرستید.", {
       reply_markup: { force_reply: true, selective: true },
     }); return;
   }
+  const repliedText = msg.reply_to_message?.text || "";
   if (repliedText && repliedText.includes("##ADMIN##")) {
     if (text) await send(env, ADMINS[0], `پیام کاربر ${from.id}:\n${text}`);
     await send(env, chatId, "پیامت ارسال شد ✅", { reply_markup: kb });
@@ -530,7 +451,7 @@ export default {
 
     // Health + Version
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(JSON.stringify({ ok: true, ver: "v1.9.0" }), {
+      return new Response(JSON.stringify({ ok: true, ver: "v2.0.0" }), {
         headers: { "content-type": "application/json" },
       });
     }

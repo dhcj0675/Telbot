@@ -1,13 +1,13 @@
-// worker.js — Bot + CSV + /version + /stats (ادمین)
-// نیازها: BOT_TOKEN (Secret) ، WH_SECRET (vars/TOML) ، KV بایند با نام "KV"
-// اختیاری: TG_SECRET_TOKEN (Secret)، ADMIN_EXPORT_SECRET (Secret)
-// - Reply Keyboard + محصولات + سفارش با Reply + پیام به ادمین + ارسال شماره
-// - CSV: /export/users.csv و /export/phones.csv (با secret)
-// - /version برای تست سریع
-// - /stats برای ادمین (نمایش آمار + دکمه دانلود CSV)
+// worker.js — Bot + CSV + /version + Admin Stats Button
+// نیازها (Dashboard/Vars):
+//   BOT_TOKEN (Secret) — الزامی
+//   WH_SECRET (Text یا در wrangler.toml) — الزامی
+//   TG_SECRET_TOKEN (Secret) — اختیاری (اگر می‌دهی، در setWebhook همان را به secret_token بده)
+//   ADMIN_EXPORT_SECRET (Secret) — اختیاری (اگر نباشد از WH_SECRET برای CSV استفاده می‌شود)
+// نیاز برای CSV: Bind با نام دقیقاً "KV" (در wrangler.toml با [[kv_namespaces]] پایدارش کن)
 
-const ADMINS = [6803856798];              // آیدی عددی ادمین‌ها
-const VERSION = "v1.1.0";                 // هر دیپلوی عوضش کن تا با /version چک کنی
+const ADMINS = [6803856798];
+const VERSION = "v1.2.0";
 
 // ——— Labels
 const KB = {
@@ -20,9 +20,11 @@ const KB = {
   time: "زمان",
   whoami: "من کیم",
   sharePhone: "ارسال شماره من",
+  stats: "آمار (ادمین)", // فقط ادمین می‌بیند
 };
 
-const REPLY_KB = {
+// ——— Reply Keyboards
+const REPLY_KB_USER = {
   keyboard: [
     [{ text: KB.home }, { text: KB.help }],
     [{ text: KB.products }, { text: KB.account }],
@@ -34,6 +36,23 @@ const REPLY_KB = {
   one_time_keyboard: false,
   input_field_placeholder: "از دکمه‌های پایین انتخاب کن…",
 };
+
+const REPLY_KB_ADMIN = {
+  keyboard: [
+    [{ text: KB.home }, { text: KB.help }],
+    [{ text: KB.products }, { text: KB.account }],
+    [{ text: KB.ping }, { text: KB.time }, { text: KB.whoami }],
+    [{ text: KB.contact }, { text: KB.sharePhone, request_contact: true }],
+    [{ text: KB.stats }], // ← دکمه آمار
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+  one_time_keyboard: false,
+  input_field_placeholder: "منوی ادمین",
+};
+
+const isAdmin = (id) => ADMINS.includes(id);
+const kbFor = (chatId) => (isAdmin(chatId) ? REPLY_KB_ADMIN : REPLY_KB_USER);
 
 // ——— Telegram helpers
 const tg = async (env, method, payload) => {
@@ -48,8 +67,7 @@ const tg = async (env, method, payload) => {
   }
   return r.json().catch(() => ({}));
 };
-const send = (env, chat_id, text, extra = {}) =>
-  tg(env, "sendMessage", { chat_id, text, ...extra });
+const send = (env, chat_id, text, extra = {}) => tg(env, "sendMessage", { chat_id, text, ...extra });
 const answerCallback = (env, id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
 const notifyAdmins = async (env, text) => {
@@ -101,11 +119,11 @@ async function startOrder(env, chatId, pid) {
     chatId,
     `##ORDER:${pid}##\nبرای ثبت سفارش، نام و توضیحاتت رو روی همین پیام **Reply** کن.\n` +
       `می‌تونی دکمه «${KB.sharePhone}» رو هم بزنی تا شماره‌ات به ادمین برسه.`,
-    { reply_markup: REPLY_KB, parse_mode: "Markdown" }
+    { reply_markup: kbFor(chatId), parse_mode: "Markdown" }
   );
 }
 
-// ——— KV helpers برای CSV (ایمن: اگر KV نبود، خطا نمی‌ده)
+// ——— KV helpers برای CSV
 const hasKV = (env) => !!env.KV;
 
 async function trackUserOnce(env, from) {
@@ -176,7 +194,6 @@ async function getCounts(env) {
   if (!hasKV(env)) return { users: 0, phones: 0, last: [] };
   const usersList = await env.KV.list({ prefix: "user:" });
   const phonesList = await env.KV.list({ prefix: "phone:" });
-  // آخرین ۱۰ کاربر
   const vals = await Promise.all(usersList.keys.map(k => env.KV.get(k.name)));
   const last = vals
     .map(v => { try { return JSON.parse(v || "{}"); } catch { return null; } })
@@ -184,15 +201,6 @@ async function getCounts(env) {
     .sort((a,b) => (b.ts||0)-(a.ts||0))
     .slice(0, 10);
   return { users: usersList.keys.length, phones: phonesList.keys.length, last };
-}
-function adminCsvUrls(env) {
-  const secret = env.ADMIN_EXPORT_SECRET || env.WH_SECRET || "";
-  const base = "https://" + (env.CF_PAGES_URL || env.CF_WORKER_URL || ""); // پوچ است؟ مشکلی نیست، فقط دکمه URL می‌خواهد
-  const root = base || ""; // اگر base خالی باشد، فقط path دکمه را می‌فرستیم
-  return {
-    users: `${root}/export/users.csv?secret=${secret}`,
-    phones: `${root}/export/phones.csv?secret=${secret}`,
-  };
 }
 
 // ——— Callbacks
@@ -208,9 +216,9 @@ async function handleCallback(update, env) {
     const pid = data.split("_")[1];
     await startOrder(env, chatId, pid);
   } else if (data === "back_home") {
-    await send(env, chatId, "به خانه برگشتی.", { reply_markup: REPLY_KB });
+    await send(env, chatId, "به خانه برگشتی.", { reply_markup: kbFor(chatId) });
   } else {
-    await send(env, chatId, `داده دکمه: ${data}`, { reply_markup: REPLY_KB });
+    await send(env, chatId, `داده دکمه: ${data}`, { reply_markup: kbFor(chatId) });
   }
 
   await answerCallback(env, cq.id);
@@ -238,24 +246,24 @@ async function handleMessage(update, env) {
       (from.username ? `@${from.username}\n` : "") +
       `تلفن: ${phone}`
     );
-    await send(env, chatId, "شماره‌ات دریافت شد ✅", { reply_markup: REPLY_KB });
+    await send(env, chatId, "شماره‌ات دریافت شد ✅", { reply_markup: kbFor(chatId) });
     return;
   }
 
   // پایه
   if (text === "/start") {
-    await send(env, chatId, "سلام! ربات فعّاله ✅", { reply_markup: REPLY_KB });
+    await send(env, chatId, "سلام! ربات فعّاله ✅", { reply_markup: kbFor(chatId) });
     return;
   }
   if (text === "/menu") {
-    await send(env, chatId, "منو باز شد ✅", { reply_markup: REPLY_KB });
+    await send(env, chatId, "منو باز شد ✅", { reply_markup: kbFor(chatId) });
     return;
   }
 
-  // ——— /stats فقط برای ادمین
-  if (text === "/stats") {
-    if (!ADMINS.includes(from.id)) {
-      await send(env, chatId, "این بخش فقط برای ادمین است.", { reply_markup: REPLY_KB });
+  // ——— دکمه آمار (ادمین)
+  if (text === KB.stats) {
+    if (!isAdmin(from.id)) {
+      await send(env, chatId, "این بخش فقط برای ادمین است.", { reply_markup: kbFor(chatId) });
       return;
     }
     const { users, phones, last } = await getCounts(env);
@@ -266,7 +274,6 @@ async function handleMessage(update, env) {
       return `${i+1}. ${name}${un} | ID: ${u.id} | ${t}`;
     }).join("\n") || "—";
 
-    // دکمه‌های لینک CSV
     const secret = env.ADMIN_EXPORT_SECRET || env.WH_SECRET || "";
     const usersUrl  = `/export/users.csv?secret=${secret}`;
     const phonesUrl = `/export/phones.csv?secret=${secret}`;
@@ -274,32 +281,30 @@ async function handleMessage(update, env) {
     await tg(env, "sendMessage", {
       chat_id: chatId,
       text: `📊 آمار:\nکاربر یکتا: ${users}\nشماره ثبت‌شده: ${phones}\n\nآخرین ۱۰ کاربر:\n${lines}`,
-      reply_markup: {
-        inline_keyboard: [[
-          { text: "CSV کاربران", url: usersUrl },
-          { text: "CSV شماره‌ها", url: phonesUrl }
-        ]]
-      }
+      reply_markup: { inline_keyboard: [[
+        { text: "CSV کاربران", url: usersUrl },
+        { text: "CSV شماره‌ها", url: phonesUrl }
+      ]]},
     });
     return;
   }
 
   // مسیرها
-  if (text === KB.home) return send(env, chatId, "صفحهٔ اول.", { reply_markup: REPLY_KB });
+  if (text === KB.home) return send(env, chatId, "صفحهٔ اول.", { reply_markup: kbFor(chatId) });
   if (text === KB.help || text === "/help")
     return send(env, chatId,
-      "راهنما:\n• محصولات → سفارش با Reply\n• پیام به ادمین با Reply\n• ارسال شماره من\n• /menu برای نمایش منو\n• /stats فقط ادمین",
-      { reply_markup: REPLY_KB }
+      "راهنما:\n• محصولات → سفارش با Reply\n• پیام به ادمین با Reply\n• ارسال شماره من\n• /menu برای نمایش منو\n• آمار (ادمین) مخصوص ادمین",
+      { reply_markup: kbFor(chatId) }
     );
   if (text === KB.products) return showProducts(env, chatId);
   if (text === KB.account || text === "/whoami")
     return send(env, chatId,
       `👤 حساب شما:\nID: ${from.id}\nنام: ${(from.first_name || "") + " " + (from.last_name || "")}`.trim(),
-      { reply_markup: REPLY_KB }
+      { reply_markup: kbFor(chatId) }
     );
-  if (text === KB.ping || text === "/ping") return send(env, chatId, "pong 🏓", { reply_markup: REPLY_KB });
-  if (text === KB.time || text === "/time") return send(env, chatId, `⏰ ${new Date().toISOString()}`, { reply_markup: REPLY_KB });
-  if (text === KB.whoami) return send(env, chatId, `ID: ${from.id}`, { reply_markup: REPLY_KB });
+  if (text === KB.ping || text === "/ping") return send(env, chatId, "pong 🏓", { reply_markup: kbFor(chatId) });
+  if (text === KB.time || text === "/time") return send(env, chatId, `⏰ ${new Date().toISOString()}`, { reply_markup: kbFor(chatId) });
+  if (text === KB.whoami) return send(env, chatId, `ID: ${from.id}`, { reply_markup: kbFor(chatId) });
 
   // پیام به ادمین: Reply روی پیام خاص
   if (text === KB.contact) {
@@ -315,7 +320,7 @@ async function handleMessage(update, env) {
       `📥 پیام کاربر برای ادمین:\nID: ${from.id}\n${from.username ? `@${from.username}\n` : ""}\n` +
       `متن:\n${text}`
     );
-    await send(env, chatId, "پیام‌تون برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
+    await send(env, chatId, "پیام‌تون برای ادمین ارسال شد ✅", { reply_markup: kbFor(chatId) });
     return;
   }
   if (repliedText && repliedText.includes("##ORDER:")) {
@@ -329,12 +334,12 @@ async function handleMessage(update, env) {
       `نام: ${(from.first_name || "") + " " + (from.last_name || "")}\n\n` +
       `متن کاربر:\n${text}`
     );
-    await send(env, chatId, "سفارش‌ت ثبت و برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
+    await send(env, chatId, "سفارش‌ت ثبت و برای ادمین ارسال شد ✅", { reply_markup: kbFor(chatId) });
     return;
   }
 
   // پیش‌فرض: اکو
-  await send(env, chatId, `Echo: ${text}`, { reply_markup: REPLY_KB });
+  await send(env, chatId, `Echo: ${text}`, { reply_markup: kbFor(chatId) });
 }
 
 // ——— Router

@@ -1,7 +1,13 @@
-// worker.js — ربات ساده + سفارش ساده + CSV خروجی (نیازمند KV)
-// Fast ACK
+// worker.js — Bot + CSV + /version  (بدون Termux)
+// - Reply Keyboard + محصولات + پیام به ادمین + ارسال شماره
+// - CSV: /export/users.csv و /export/phones.csv با secret
+// - /version برای تست دیپلوی
+// نیازها: BOT_TOKEN (Secret) ، WH_SECRET (vars یا TOML)
+// اختیاری: TG_SECRET_TOKEN (Secret)، ADMIN_EXPORT_SECRET (Secret)
+// اختیاری برای CSV: KV بایند با نام دقیقاً "KV"
 
-const ADMINS = [6803856798]; // آیدی عددی ادمین‌ها
+const ADMINS = [6803856798]; // آیدی عددی ادمین‌ها (تو می‌تونی تغییر بدی)
+const VERSION = "csv-enabled-1";
 
 // ——— Labels
 const KB = {
@@ -36,12 +42,21 @@ const tg = async (env, method, payload) => {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload || {}),
   });
+  // لاگِ خطای تلگرام برای دیباگ
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    console.error("TG", method, r.status, t);
+  }
   return r.json().catch(() => ({}));
 };
 const send = (env, chat_id, text, extra = {}) =>
   tg(env, "sendMessage", { chat_id, text, ...extra });
 const answerCallback = (env, id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
+
+const notifyAdmins = async (env, text) => {
+  for (const admin of ADMINS) await send(env, admin, text);
+};
 
 // ——— محصولات
 const PRODUCTS = {
@@ -54,17 +69,56 @@ const productText = (pid) => {
   return p ? `${p.title} — قیمت: ${p.price}` : "محصول نامعتبر";
 };
 
-// ——— KV helpers (ایمن: اگر KV نبود، خطا نمی‌ده)
+async function showProducts(env, chatId) {
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: "لیست محصولات:",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "محصول ۱ (100k)", callback_data: "prod_1" },
+          { text: "محصول ۲ (175k)", callback_data: "prod_2" },
+        ],
+        [{ text: "محصول ۳ (450k)", callback_data: "prod_3" }],
+        [{ text: "بازگشت", callback_data: "back_home" }],
+      ],
+    },
+  });
+}
+async function showProduct(env, chatId, pid) {
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: productText(pid),
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🛒 سفارش این محصول", callback_data: `order_${pid}` }],
+        [{ text: "بازگشت", callback_data: "back_home" }],
+      ],
+    },
+  });
+}
+async function startOrder(env, chatId, pid) {
+  // سفارش با Reply (بدون state/KV)
+  await send(
+    env,
+    chatId,
+    `##ORDER:${pid}##\nبرای ثبت سفارش، نام و توضیحاتت رو روی همین پیام **Reply** کن.\n` +
+      `می‌تونی دکمه «${KB.sharePhone}» رو هم بزنی تا شماره‌ات به ادمین برسه.`,
+    { reply_markup: REPLY_KB, parse_mode: "Markdown" }
+  );
+}
+
+// ——— KV helpers برای CSV (ایمن: اگر KV نبود، خطا نمی‌ده)
 const hasKV = (env) => !!env.KV;
 
 async function trackUserOnce(env, from) {
   if (!hasKV(env)) return;
   try {
-    const k = `user:${from.id}`;
-    const had = await env.KV.get(k);
+    const key = `user:${from.id}`;
+    const had = await env.KV.get(key);
     if (!had) {
       await env.KV.put(
-        k,
+        key,
         JSON.stringify({
           id: from.id,
           username: from.username || "",
@@ -75,19 +129,17 @@ async function trackUserOnce(env, from) {
       );
     }
   } catch (e) {
-    console.error("trackUserOnce KV error:", e);
+    console.error("KV trackUserOnce", e);
   }
 }
-
 async function savePhone(env, id, phone) {
   if (!hasKV(env)) return;
   try {
     await env.KV.put(`phone:${id}`, phone);
   } catch (e) {
-    console.error("savePhone KV error:", e);
+    console.error("KV savePhone", e);
   }
 }
-
 async function buildUsersCSV(env) {
   if (!hasKV(env)) return "id,username,first_name,last_name,ts_iso\n";
   const list = await env.KV.list({ prefix: "user:" });
@@ -106,7 +158,6 @@ async function buildUsersCSV(env) {
   }
   return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(",")).join("\n");
 }
-
 async function buildPhonesCSV(env) {
   if (!hasKV(env)) return "id,phone,username,first_name,last_name,ts_iso\n";
   const list = await env.KV.list({ prefix: "phone:" });
@@ -126,51 +177,6 @@ async function buildPhonesCSV(env) {
     ]);
   }
   return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(",")).join("\n");
-}
-
-// ——— اینلاین‌باتن‌ها
-async function showProducts(env, chatId) {
-  await tg(env, "sendMessage", {
-    chat_id: chatId,
-    text: "لیست محصولات:",
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "محصول ۱ (100k)", callback_data: "prod_1" },
-          { text: "محصول ۲ (175k)", callback_data: "prod_2" },
-        ],
-        [{ text: "محصول ۳ (450k)", callback_data: "prod_3" }],
-        [{ text: "بازگشت", callback_data: "back_home" }],
-      ],
-    },
-  });
-}
-
-async function showProduct(env, chatId, pid) {
-  await tg(env, "sendMessage", {
-    chat_id: chatId,
-    text: productText(pid),
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🛒 سفارش این محصول", callback_data: `order_${pid}` }],
-        [{ text: "بازگشت", callback_data: "back_home" }],
-      ],
-    },
-  });
-}
-
-async function startOrder(env, chatId, pid) {
-  await send(
-    env,
-    chatId,
-    `##ORDER:${pid}##\nبرای ثبت سفارش، نام و توضیحاتت رو روی همین پیام **Reply** کن.\n` +
-      `می‌تونی دکمه «${KB.sharePhone}» رو هم بزنی تا شماره‌ات به ادمین برسه.`,
-    { reply_markup: REPLY_KB, parse_mode: "Markdown" }
-  );
-}
-
-async function notifyAdmins(env, text) {
-  for (const admin of ADMINS) await send(env, admin, text);
 }
 
 // ——— Callbacks
@@ -203,8 +209,8 @@ async function handleMessage(update, env) {
   const from = msg.from || {};
   const text = (msg.text || "").trim();
 
-  // ثبت کاربر (فقط یک‌بار)
-  if (from?.id) ctxWait(trackUserOnce(env, from));
+  // ثبت کاربر برای CSV (یک‌بار)
+  if (from?.id) trackUserOnce(env, from);
 
   // دریافت شماره
   if (msg.contact && msg.contact.user_id === from.id) {
@@ -213,8 +219,8 @@ async function handleMessage(update, env) {
     await notifyAdmins(
       env,
       `📥 شمارهٔ کاربر:\nID: ${from.id}\nنام: ${(from.first_name || "") + " " + (from.last_name || "")}\n` +
-        (from.username ? `@${from.username}\n` : "") +
-        `تلفن: ${phone}`
+      (from.username ? `@${from.username}\n` : "") +
+      `تلفن: ${phone}`
     );
     await send(env, chatId, "شماره‌ات دریافت شد ✅", { reply_markup: REPLY_KB });
     return;
@@ -263,7 +269,7 @@ async function handleMessage(update, env) {
     await notifyAdmins(
       env,
       `📥 پیام کاربر برای ادمین:\nID: ${from.id}\n${from.username ? `@${from.username}\n` : ""}\n` +
-        `متن:\n${text}`
+      `متن:\n${text}`
     );
     await send(env, chatId, "پیام‌تون برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
     return;
@@ -275,9 +281,9 @@ async function handleMessage(update, env) {
     await notifyAdmins(
       env,
       `🧾 سفارش جدید:\nمحصول: ${p}\n\nاز:\nID: ${from.id}\n` +
-        (from.username ? `@${from.username}\n` : "") +
-        `نام: ${(from.first_name || "") + " " + (from.last_name || "")}\n\n` +
-        `متن کاربر:\n${text}`
+      (from.username ? `@${from.username}\n` : "") +
+      `نام: ${(from.first_name || "") + " " + (from.last_name || "")}\n\n` +
+      `متن کاربر:\n${text}`
     );
     await send(env, chatId, "سفارش‌ت ثبت و برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
     return;
@@ -285,11 +291,6 @@ async function handleMessage(update, env) {
 
   // پیش‌فرض: اکو
   await send(env, chatId, `Echo: ${text}`, { reply_markup: REPLY_KB });
-}
-
-// Helper برای اجرای async بدون await (مثل ctx.waitUntil)
-function ctxWait(promise) {
-  promise?.catch?.(e => console.error("ctxWait error:", e));
 }
 
 async function handleUpdate(update, env) {
@@ -305,14 +306,16 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // سلامت
-    if (request.method === "GET" && url.pathname === "/")
-      return new Response(JSON.stringify({ ok: true }), {
+    // ——— /version برای تست سریع
+    if (request.method === "GET" && url.pathname === "/version") {
+      return new Response(JSON.stringify({ ok: true, version: VERSION }), {
         headers: { "content-type": "application/json" },
       });
+    }
 
-    // CSV (با secret)
+    // ——— CSV endpoints (قبل از not found)
     const exportSecret = env.ADMIN_EXPORT_SECRET || env.WH_SECRET;
+
     if (request.method === "GET" && url.pathname === "/export/users.csv") {
       if (!exportSecret || url.searchParams.get("secret") !== exportSecret)
         return new Response("forbidden", { status: 403 });
@@ -324,6 +327,7 @@ export default {
         },
       });
     }
+
     if (request.method === "GET" && url.pathname === "/export/phones.csv") {
       if (!exportSecret || url.searchParams.get("secret") !== exportSecret)
         return new Response("forbidden", { status: 403 });
@@ -336,17 +340,29 @@ export default {
       });
     }
 
-    // وبهوک تلگرام
+    // ——— Webhook تلگرام (Fast ACK)
     if (request.method === "POST" && url.pathname === `/webhook/${env.WH_SECRET}`) {
-      const hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+      // اگر TG_SECRET_TOKEN ست شده، هدر باید بخوره
+      const hdr =
+        request.headers.get("X-Telegram-Bot-Api-Secret-Token") ||
+        request.headers.get("X-Telegram-BOT-API-SECRET-TOKEN") ||
+        "";
       if (env.TG_SECRET_TOKEN && hdr !== env.TG_SECRET_TOKEN)
         return new Response("forbidden", { status: 403 });
 
       let update = null; try { update = await request.json(); } catch {}
-      ctx.waitUntil(handleUpdate(update, env));
-      return new Response("ok");
+      ctx.waitUntil(handleUpdate(update, env)); // پردازش در پس‌زمینه
+      return new Response("ok");               // پاسخ فوری
     }
 
+    // ——— Health (اختیاری)
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response(JSON.stringify({ ok: true, version: VERSION }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    // ——— سایر مسیرها
     return new Response("not found", { status: 404 });
   },
 };

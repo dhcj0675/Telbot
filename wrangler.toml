@@ -5,5 +5,11 @@ compatibility_date = "2024-10-01"
 [vars]
 WH_SECRET = "dhcj0675121971"
 
+# 👇 اتصال دائمی KV به Worker (هم Production هم Preview)
+[[kv_namespaces]]
+binding = "KV"                                  # باید دقیقا با env.KV در کد یکی باشد
+id = "261ee020d94442a9be799a7bba9a3d9b"         # Namespace ID (Production)
+preview_id = "261ee020d94442a9be799a7bba9a3d9b" # برای Preview هم همین را بگذار
+
 [observability.logs]
 enabled = true

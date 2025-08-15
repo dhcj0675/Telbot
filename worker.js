@@ -1,4 +1,4 @@
-// worker.js — Bot + CSV + /version + Admin Stats Button
+// worker.js — Bot + CSV + /version + Admin Stats Button (پچ‌شده)
 // نیازها (Dashboard/Vars):
 //   BOT_TOKEN (Secret) — الزامی
 //   WH_SECRET (Text یا در wrangler.toml) — الزامی
@@ -6,8 +6,8 @@
 //   ADMIN_EXPORT_SECRET (Secret) — اختیاری (اگر نباشد از WH_SECRET برای CSV استفاده می‌شود)
 // نیاز برای CSV: Bind با نام دقیقاً "KV" (در wrangler.toml با [[kv_namespaces]] پایدارش کن)
 
-const ADMINS = [6803856798];
-const VERSION = "v1.2.0";
+const ADMINS = [6803856798];      // آیدی عددی ادمین‌ها
+const VERSION = "v1.2.1";         // هر دیپلوی تغییر بده تا /version را چک کنی
 
 // ——— Labels
 const KB = {
@@ -70,9 +70,7 @@ const tg = async (env, method, payload) => {
 const send = (env, chat_id, text, extra = {}) => tg(env, "sendMessage", { chat_id, text, ...extra });
 const answerCallback = (env, id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
-const notifyAdmins = async (env, text) => {
-  for (const admin of ADMINS) await send(env, admin, text);
-};
+const notifyAdmins = async (env, text) => { for (const admin of ADMINS) await send(env, admin, text); };
 
 // ——— محصولات
 const PRODUCTS = {
@@ -123,7 +121,7 @@ async function startOrder(env, chatId, pid) {
   );
 }
 
-// ——— KV helpers برای CSV
+// ——— KV helpers برای CSV (ایمن: اگر KV نبود، خطا نمی‌ده)
 const hasKV = (env) => !!env.KV;
 
 async function trackUserOnce(env, from) {
@@ -189,18 +187,41 @@ async function buildPhonesCSV(env) {
   return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(",")).join("\n");
 }
 
-// ——— آمار ادمین
-async function getCounts(env) {
-  if (!hasKV(env)) return { users: 0, phones: 0, last: [] };
-  const usersList = await env.KV.list({ prefix: "user:" });
-  const phonesList = await env.KV.list({ prefix: "phone:" });
-  const vals = await Promise.all(usersList.keys.map(k => env.KV.get(k.name)));
-  const last = vals
-    .map(v => { try { return JSON.parse(v || "{}"); } catch { return null; } })
-    .filter(Boolean)
-    .sort((a,b) => (b.ts||0)-(a.ts||0))
-    .slice(0, 10);
-  return { users: usersList.keys.length, phones: phonesList.keys.length, last };
+// ——— آمار ادمین (تابع جدا برای استفاده مجدد)
+async function showAdminStats(env, chatId) {
+  async function getCounts(env) {
+    if (!hasKV(env)) return { users: 0, phones: 0, last: [] };
+    const usersList = await env.KV.list({ prefix: "user:" });
+    const phonesList = await env.KV.list({ prefix: "phone:" });
+    const vals = await Promise.all(usersList.keys.map(k => env.KV.get(k.name)));
+    const last = vals
+      .map(v => { try { return JSON.parse(v || "{}"); } catch { return null; } })
+      .filter(Boolean)
+      .sort((a,b) => (b.ts||0)-(a.ts||0))
+      .slice(0, 10);
+    return { users: usersList.keys.length, phones: phonesList.keys.length, last };
+  }
+
+  const { users, phones, last } = await getCounts(env);
+  const lines = last.map((u,i)=>{
+    const name = `${u.first_name||""} ${u.last_name||""}`.trim() || "کاربر";
+    const un = u.username ? ` @${u.username}` : "";
+    const t = u.ts ? new Date(u.ts).toISOString() : "";
+    return `${i+1}. ${name}${un} | ID: ${u.id} | ${t}`;
+  }).join("\n") || "—";
+
+  const secret = env.ADMIN_EXPORT_SECRET || env.WH_SECRET || "";
+  const usersUrl  = `/export/users.csv?secret=${secret}`;
+  const phonesUrl = `/export/phones.csv?secret=${secret}`;
+
+  await tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: `📊 آمار:\nکاربر یکتا: ${users}\nشماره ثبت‌شده: ${phones}\n\nآخرین ۱۰ کاربر:\n${lines}`,
+    reply_markup: { inline_keyboard: [[
+      { text: "CSV کاربران", url: usersUrl },
+      { text: "CSV شماره‌ها", url: phonesUrl }
+    ]]}
+  });
 }
 
 // ——— Callbacks
@@ -232,6 +253,7 @@ async function handleMessage(update, env) {
   const chatId = msg.chat.id;
   const from = msg.from || {};
   const text = (msg.text || "").trim();
+  console.log("MSG TEXT:", JSON.stringify(text)); // برای دیباگ تفاوت یونیکد/فاصله
 
   // ثبت کاربر برای CSV (یک‌بار)
   if (from?.id) trackUserOnce(env, from);
@@ -260,32 +282,18 @@ async function handleMessage(update, env) {
     return;
   }
 
-  // ——— دکمه آمار (ادمین)
-  if (text === KB.stats) {
+  // ——— آمار (ادمین): حساسیت کمتر به تفاوت متن/فاصله/کامند
+  if (
+    text === KB.stats ||
+    text === "/stats" ||
+    text.replace(/\s+/g, "").includes("آمار(ادمین)") ||
+    (isAdmin(from.id) && text.includes("آمار"))
+  ) {
     if (!isAdmin(from.id)) {
       await send(env, chatId, "این بخش فقط برای ادمین است.", { reply_markup: kbFor(chatId) });
       return;
     }
-    const { users, phones, last } = await getCounts(env);
-    const lines = last.map((u,i)=>{
-      const name = `${u.first_name||""} ${u.last_name||""}`.trim() || "کاربر";
-      const un = u.username ? ` @${u.username}` : "";
-      const t = u.ts ? new Date(u.ts).toISOString() : "";
-      return `${i+1}. ${name}${un} | ID: ${u.id} | ${t}`;
-    }).join("\n") || "—";
-
-    const secret = env.ADMIN_EXPORT_SECRET || env.WH_SECRET || "";
-    const usersUrl  = `/export/users.csv?secret=${secret}`;
-    const phonesUrl = `/export/phones.csv?secret=${secret}`;
-
-    await tg(env, "sendMessage", {
-      chat_id: chatId,
-      text: `📊 آمار:\nکاربر یکتا: ${users}\nشماره ثبت‌شده: ${phones}\n\nآخرین ۱۰ کاربر:\n${lines}`,
-      reply_markup: { inline_keyboard: [[
-        { text: "CSV کاربران", url: usersUrl },
-        { text: "CSV شماره‌ها", url: phonesUrl }
-      ]]},
-    });
+    await showAdminStats(env, chatId);
     return;
   }
 

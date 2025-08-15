@@ -1,5 +1,5 @@
-// worker.js — KV Cursor Pagination + Pretty Admin Stats (+ phone) + Admin Panel + Phone Gate (ساده)
-// نسخه: v2.0.0
+// worker.js — KV Cursor Pagination + Pretty Admin Stats (+ phone) + Admin Panel + Phone Gate + Products + Account
+// نسخه: v2.1.0
 
 /************ تنظیمات ************/
 const ADMINS = [6803856798];   // آی‌دی عددی ادمین‌ها
@@ -167,7 +167,7 @@ async function pageUsersByIndex(env, cursor = undefined, limit = PAGE_SIZE) {
   return { items, nextCursor: resp.cursor || null, complete: !!resp.list_complete };
 }
 
-/************ CSV (همانند قبل) ************/
+/************ CSV ************/
 function csvOfRows(rows) {
   return rows.map(r => r.map(x => `"${String(x ?? "").replace(/"/g,'""')}"`).join(",")).join("\n");
 }
@@ -311,16 +311,13 @@ async function handleCallback(update, env) {
     return;
   }
 
-  // آمار: شروع
+  // آمار: شروع/بعدی/قبلی
   if (data === "admin:stats:start") {
     await answerCallback(env, cq.id);
     await clearStack(env, chatId);
-    // صفحه اول: cursor undefined
     await renderStatsPage(env, chatId, chatId, undefined);
     return;
   }
-
-  // آمار: بعدی
   if (data === "admin:stats:next") {
     await answerCallback(env, cq.id);
     const next = await env.KV.get(nextKey(chatId));
@@ -332,15 +329,11 @@ async function handleCallback(update, env) {
     }
     return;
   }
-
-  // آمار: قبلی
   if (data === "admin:stats:prev") {
     await answerCallback(env, cq.id);
-    // صفحه فعلی را کنار بگذار، برگرد به قبل‌تر
     const _discard = await popCursor(env, chatId);
     const prev = await popCursor(env, chatId);
     if (prev) {
-      // چون یکی اضافه برداشتیم، prev را دوباره push کنیم تا شاخص درست بماند
       await pushCursor(env, chatId, prev);
       await renderStatsPage(env, chatId, chatId, prev);
     } else {
@@ -361,6 +354,28 @@ async function handleCallback(update, env) {
     await answerCallback(env, cq.id);
     try { const csv = await buildPhonesCSV(env); await sendCSVDocument(env, chatId, "phones.csv", csv, "CSV شماره‌ها"); }
     catch(e){ console.error("csv phones", e); await send(env, chatId, "ارسال CSV شماره‌ها با خطا مواجه شد."); }
+    return;
+  }
+
+  // --- محصولات (Callback ها) ---
+  if (data === "prod_1") {
+    await answerCallback(env, cq.id);
+    await send(env, chatId, "🛍️ محصول ۱ — قیمت: 100,000 تومان");
+    return;
+  }
+  if (data === "prod_2") {
+    await answerCallback(env, cq.id);
+    await send(env, chatId, "🛍️ محصول ۲ — قیمت: 175,000 تومان");
+    return;
+  }
+  if (data === "prod_3") {
+    await answerCallback(env, cq.id);
+    await send(env, chatId, "🛍️ محصول ۳ — قیمت: 450,000 تومان");
+    return;
+  }
+  if (data === "back_home") {
+    await answerCallback(env, cq.id);
+    await send(env, chatId, "به خانه برگشتی ✅", { reply_markup: kbFor(chatId) });
     return;
   }
 
@@ -389,7 +404,7 @@ async function handleMessage(update, env) {
     return;
   }
 
-  // Phone Gate (ساده: اینجا می‌تونی وایت‌لیست هم اضافه کنی اگر خواستی)
+  // Phone Gate (غیر ادمین‌ها تا شماره ندهند یا WL نباشند → متوقف می‌شوند)
   if (!isAdmin(from.id) && env.KV) {
     const white = await isWhitelistedKV(env, from.id);
     if (!white) {
@@ -412,6 +427,47 @@ async function handleMessage(update, env) {
       "راهنما:\n• ارسال شماره من\n• پیام به ادمین (Reply)\n• /menu برای نمایش منو\n• ادمین: دکمه «مدیریت ادمین»",
       { reply_markup: kb }
     ); return;
+  }
+
+  // --- محصولات (نمایش منو) ---
+  if (text === KB.products) {
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: "لیست محصولات:",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "محصول ۱ (100,000 تومان)", callback_data: "prod_1" },
+           { text: "محصول ۲ (175,000 تومان)", callback_data: "prod_2" }],
+          [{ text: "محصول ۳ (450,000 تومان)", callback_data: "prod_3" }],
+          [{ text: "↩️ بازگشت", callback_data: "back_home" }]
+        ]
+      }
+    });
+    return;
+  }
+
+  // --- حساب (نمایش مشخصات + شماره) ---
+  if (text === KB.account) {
+    const u = from;
+    const phone = await getPhone(env, u.id);
+    const name = `${u.first_name || ""} ${u.last_name || ""}`.trim() || "—";
+    const un = u.username ? `@${u.username}` : "—";
+    const lines = [
+      "👤 حساب شما:",
+      `ID: ${u.id}`,
+      `نام: ${name}`,
+      `یوزرنیم: ${un}`,
+      `شماره: ${phone ? phone : "—"}`
+    ].join("\n");
+
+    if (phone) {
+      await send(env, chatId, lines, { reply_markup: kb });
+    } else {
+      await send(env, chatId, lines + "\n\nبرای تکمیل حساب، شماره‌ات را بفرست:", {
+        reply_markup: REPLY_KB_CONTACT_ONLY
+      });
+    }
+    return;
   }
 
   // پنل ادمین
@@ -451,7 +507,7 @@ export default {
 
     // Health + Version
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(JSON.stringify({ ok: true, ver: "v2.0.0" }), {
+      return new Response(JSON.stringify({ ok: true, ver: "v2.1.0" }), {
         headers: { "content-type": "application/json" },
       });
     }

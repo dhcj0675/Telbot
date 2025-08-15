@@ -1,14 +1,13 @@
-// worker.js — Bot + CSV + /version  (بدون Termux)
-// قابلیت‌ها:
+// worker.js — Bot + CSV + /version + /stats (ادمین)
+// نیازها: BOT_TOKEN (Secret) ، WH_SECRET (vars/TOML) ، KV بایند با نام "KV"
+// اختیاری: TG_SECRET_TOKEN (Secret)، ADMIN_EXPORT_SECRET (Secret)
 // - Reply Keyboard + محصولات + سفارش با Reply + پیام به ادمین + ارسال شماره
 // - CSV: /export/users.csv و /export/phones.csv (با secret)
-// - /version برای تست سریع دیپلوی
-// نیازها: BOT_TOKEN (Secret) ، WH_SECRET (در wrangler.toml یا Dashboard - یکی را انتخاب کن)
-// اختیاری: TG_SECRET_TOKEN (Secret)، ADMIN_EXPORT_SECRET (Secret)
-// اختیاری برای CSV: KV با نام بایند دقیقاً "KV"
+// - /version برای تست سریع
+// - /stats برای ادمین (نمایش آمار + دکمه دانلود CSV)
 
 const ADMINS = [6803856798];              // آیدی عددی ادمین‌ها
-const VERSION = "v1.0.0";                 // هر دیپلوی عوضش کن تا /version را چک کنی
+const VERSION = "v1.1.0";                 // هر دیپلوی عوضش کن تا با /version چک کنی
 
 // ——— Labels
 const KB = {
@@ -53,7 +52,6 @@ const send = (env, chat_id, text, extra = {}) =>
   tg(env, "sendMessage", { chat_id, text, ...extra });
 const answerCallback = (env, id, text = "", show_alert = false) =>
   tg(env, "answerCallbackQuery", { callback_query_id: id, text, show_alert });
-
 const notifyAdmins = async (env, text) => {
   for (const admin of ADMINS) await send(env, admin, text);
 };
@@ -173,6 +171,30 @@ async function buildPhonesCSV(env) {
   return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(",")).join("\n");
 }
 
+// ——— آمار ادمین
+async function getCounts(env) {
+  if (!hasKV(env)) return { users: 0, phones: 0, last: [] };
+  const usersList = await env.KV.list({ prefix: "user:" });
+  const phonesList = await env.KV.list({ prefix: "phone:" });
+  // آخرین ۱۰ کاربر
+  const vals = await Promise.all(usersList.keys.map(k => env.KV.get(k.name)));
+  const last = vals
+    .map(v => { try { return JSON.parse(v || "{}"); } catch { return null; } })
+    .filter(Boolean)
+    .sort((a,b) => (b.ts||0)-(a.ts||0))
+    .slice(0, 10);
+  return { users: usersList.keys.length, phones: phonesList.keys.length, last };
+}
+function adminCsvUrls(env) {
+  const secret = env.ADMIN_EXPORT_SECRET || env.WH_SECRET || "";
+  const base = "https://" + (env.CF_PAGES_URL || env.CF_WORKER_URL || ""); // پوچ است؟ مشکلی نیست، فقط دکمه URL می‌خواهد
+  const root = base || ""; // اگر base خالی باشد، فقط path دکمه را می‌فرستیم
+  return {
+    users: `${root}/export/users.csv?secret=${secret}`,
+    phones: `${root}/export/phones.csv?secret=${secret}`,
+  };
+}
+
 // ——— Callbacks
 async function handleCallback(update, env) {
   const cq = update.callback_query;
@@ -230,11 +252,43 @@ async function handleMessage(update, env) {
     return;
   }
 
+  // ——— /stats فقط برای ادمین
+  if (text === "/stats") {
+    if (!ADMINS.includes(from.id)) {
+      await send(env, chatId, "این بخش فقط برای ادمین است.", { reply_markup: REPLY_KB });
+      return;
+    }
+    const { users, phones, last } = await getCounts(env);
+    const lines = last.map((u,i)=>{
+      const name = `${u.first_name||""} ${u.last_name||""}`.trim() || "کاربر";
+      const un = u.username ? ` @${u.username}` : "";
+      const t = u.ts ? new Date(u.ts).toISOString() : "";
+      return `${i+1}. ${name}${un} | ID: ${u.id} | ${t}`;
+    }).join("\n") || "—";
+
+    // دکمه‌های لینک CSV
+    const secret = env.ADMIN_EXPORT_SECRET || env.WH_SECRET || "";
+    const usersUrl  = `/export/users.csv?secret=${secret}`;
+    const phonesUrl = `/export/phones.csv?secret=${secret}`;
+
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      text: `📊 آمار:\nکاربر یکتا: ${users}\nشماره ثبت‌شده: ${phones}\n\nآخرین ۱۰ کاربر:\n${lines}`,
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "CSV کاربران", url: usersUrl },
+          { text: "CSV شماره‌ها", url: phonesUrl }
+        ]]
+      }
+    });
+    return;
+  }
+
   // مسیرها
   if (text === KB.home) return send(env, chatId, "صفحهٔ اول.", { reply_markup: REPLY_KB });
   if (text === KB.help || text === "/help")
     return send(env, chatId,
-      "راهنما:\n• محصولات → سفارش با Reply\n• پیام به ادمین با Reply\n• ارسال شماره من\n• /menu برای نمایش منو",
+      "راهنما:\n• محصولات → سفارش با Reply\n• پیام به ادمین با Reply\n• ارسال شماره من\n• /menu برای نمایش منو\n• /stats فقط ادمین",
       { reply_markup: REPLY_KB }
     );
   if (text === KB.products) return showProducts(env, chatId);

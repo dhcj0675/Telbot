@@ -1,4 +1,4 @@
-// worker.js — منوی لیبلی + محصولات + سفارش با حالت مکالمه (نام/آدرس) + آمار ساده (بدون KV)
+// worker.js — ربات ساده + سفارش ساده + CSV خروجی (نیازمند KV)
 // Fast ACK
 
 const ADMINS = [6803856798]; // آیدی عددی ادمین‌ها
@@ -54,11 +54,81 @@ const productText = (pid) => {
   return p ? `${p.title} — قیمت: ${p.price}` : "محصول نامعتبر";
 };
 
-// ——— حالت مکالمه سفارش (در حافظه موقتِ اجرا)
-const ORDER_STATE = new Map(); // chatId -> { pid, step: 'ask_name'|'ask_address', data:{name,address} }
-let MSG_COUNT = 0;
-let ORDER_COUNT = 0;
+// ——— KV helpers (ایمن: اگر KV نبود، خطا نمی‌ده)
+const hasKV = (env) => !!env.KV;
 
+async function trackUserOnce(env, from) {
+  if (!hasKV(env)) return;
+  try {
+    const k = `user:${from.id}`;
+    const had = await env.KV.get(k);
+    if (!had) {
+      await env.KV.put(
+        k,
+        JSON.stringify({
+          id: from.id,
+          username: from.username || "",
+          first_name: from.first_name || "",
+          last_name: from.last_name || "",
+          ts: Date.now(),
+        })
+      );
+    }
+  } catch (e) {
+    console.error("trackUserOnce KV error:", e);
+  }
+}
+
+async function savePhone(env, id, phone) {
+  if (!hasKV(env)) return;
+  try {
+    await env.KV.put(`phone:${id}`, phone);
+  } catch (e) {
+    console.error("savePhone KV error:", e);
+  }
+}
+
+async function buildUsersCSV(env) {
+  if (!hasKV(env)) return "id,username,first_name,last_name,ts_iso\n";
+  const list = await env.KV.list({ prefix: "user:" });
+  const rows = [["id", "username", "first_name", "last_name", "ts_iso"]];
+  for (const { name } of list.keys) {
+    const v = await env.KV.get(name);
+    if (!v) continue;
+    let o; try { o = JSON.parse(v); } catch { continue; }
+    rows.push([
+      o.id ?? "",
+      o.username ? `@${o.username}` : "",
+      o.first_name ?? "",
+      o.last_name ?? "",
+      o.ts ? new Date(o.ts).toISOString() : "",
+    ]);
+  }
+  return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(",")).join("\n");
+}
+
+async function buildPhonesCSV(env) {
+  if (!hasKV(env)) return "id,phone,username,first_name,last_name,ts_iso\n";
+  const list = await env.KV.list({ prefix: "phone:" });
+  const rows = [["id", "phone", "username", "first_name", "last_name", "ts_iso"]];
+  for (const { name } of list.keys) {
+    const id = name.replace("phone:", "");
+    const phone = await env.KV.get(name);
+    let u = {};
+    try { u = JSON.parse((await env.KV.get(`user:${id}`)) || "{}"); } catch {}
+    rows.push([
+      id,
+      phone ?? "",
+      u.username ? `@${u.username}` : "",
+      u.first_name ?? "",
+      u.last_name ?? "",
+      u.ts ? new Date(u.ts).toISOString() : "",
+    ]);
+  }
+  return rows.map(r => r.map(x => `"${String(x).replace(/"/g,'""')}"`).join(",")).join("\n");
+}
+
+// ——— اینلاین‌باتن‌ها
 async function showProducts(env, chatId) {
   await tg(env, "sendMessage", {
     chat_id: chatId,
@@ -89,16 +159,21 @@ async function showProduct(env, chatId, pid) {
   });
 }
 
-async function startOrderFlow(env, chatId, pid) {
-  ORDER_STATE.set(chatId, { pid, step: "ask_name", data: {} });
+async function startOrder(env, chatId, pid) {
   await send(
     env,
     chatId,
-    `سفارش «${productText(pid)}»\n\nلطفاً *نام و نام خانوادگی* خود را ارسال کنید.\n(در هر لحظه با /cancel می‌تونی لغو کنی)`,
+    `##ORDER:${pid}##\nبرای ثبت سفارش، نام و توضیحاتت رو روی همین پیام **Reply** کن.\n` +
+      `می‌تونی دکمه «${KB.sharePhone}» رو هم بزنی تا شماره‌ات به ادمین برسه.`,
     { reply_markup: REPLY_KB, parse_mode: "Markdown" }
   );
 }
 
+async function notifyAdmins(env, text) {
+  for (const admin of ADMINS) await send(env, admin, text);
+}
+
+// ——— Callbacks
 async function handleCallback(update, env) {
   const cq = update.callback_query;
   const chatId = cq.message?.chat?.id;
@@ -109,7 +184,7 @@ async function handleCallback(update, env) {
     await showProduct(env, chatId, pid);
   } else if (data.startsWith("order_")) {
     const pid = data.split("_")[1];
-    await startOrderFlow(env, chatId, pid);
+    await startOrder(env, chatId, pid);
   } else if (data === "back_home") {
     await send(env, chatId, "به خانه برگشتی.", { reply_markup: REPLY_KB });
   } else {
@@ -119,56 +194,7 @@ async function handleCallback(update, env) {
   await answerCallback(env, cq.id);
 }
 
-async function notifyAdmins(env, text) {
-  for (const admin of ADMINS) await send(env, admin, text);
-}
-
-async function handleOrderConversation(env, msg, from, chatId, text) {
-  const st = ORDER_STATE.get(chatId);
-  if (!st) return false;
-
-  if (text === "/cancel") {
-    ORDER_STATE.delete(chatId);
-    await send(env, chatId, "سفارش لغو شد ❌", { reply_markup: REPLY_KB });
-    return true;
-  }
-
-  if (st.step === "ask_name") {
-    st.data.name = text.trim();
-    st.step = "ask_address";
-    ORDER_STATE.set(chatId, st);
-    await send(env, chatId, "خیلی خوب! حالا *آدرس کامل* رو بفرست:", {
-      reply_markup: REPLY_KB,
-      parse_mode: "Markdown",
-    });
-    return true;
-  }
-
-  if (st.step === "ask_address") {
-    st.data.address = text.trim();
-    const pid = st.pid;
-    const p = PRODUCTS[pid];
-    ORDER_STATE.delete(chatId);
-    ORDER_COUNT++;
-
-    // ارسال خلاصه سفارش برای ادمین
-    const summary =
-      `🧾 سفارش جدید\n` +
-      `محصول: ${p ? `${p.title} (${p.price})` : pid}\n\n` +
-      `از:\nID: ${from.id}\n` +
-      (from.username ? `@${from.username}\n` : "") +
-      `نام: ${(from.first_name || "") + " " + (from.last_name || "")}\n\n` +
-      `📌 نام مشتری: ${st.data.name}\n` +
-      `📍 آدرس: ${st.data.address}`;
-
-    await notifyAdmins(env, summary);
-    await send(env, chatId, "سفارش‌ت ثبت شد و برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
-    return true;
-  }
-
-  return false;
-}
-
+// ——— Messages
 async function handleMessage(update, env) {
   const msg = update.message || update.edited_message;
   if (!msg) return;
@@ -176,11 +202,14 @@ async function handleMessage(update, env) {
   const chatId = msg.chat.id;
   const from = msg.from || {};
   const text = (msg.text || "").trim();
-  MSG_COUNT++;
 
-  // شماره کاربر
+  // ثبت کاربر (فقط یک‌بار)
+  if (from?.id) ctxWait(trackUserOnce(env, from));
+
+  // دریافت شماره
   if (msg.contact && msg.contact.user_id === from.id) {
     const phone = msg.contact.phone_number;
+    await savePhone(env, from.id, phone);
     await notifyAdmins(
       env,
       `📥 شمارهٔ کاربر:\nID: ${from.id}\nنام: ${(from.first_name || "") + " " + (from.last_name || "")}\n` +
@@ -191,10 +220,7 @@ async function handleMessage(update, env) {
     return;
   }
 
-  // اگر در حالت سفارش هستیم، اول همون رو مدیریت کن
-  if (await handleOrderConversation(env, msg, from, chatId, text)) return;
-
-  // دستورات پایه
+  // پایه
   if (text === "/start") {
     await send(env, chatId, "سلام! ربات فعّاله ✅", { reply_markup: REPLY_KB });
     return;
@@ -203,51 +229,27 @@ async function handleMessage(update, env) {
     await send(env, chatId, "منو باز شد ✅", { reply_markup: REPLY_KB });
     return;
   }
-  if (text === "/cancel") {
-    ORDER_STATE.delete(chatId);
-    await send(env, chatId, "اگر سفارشی در جریان بود، لغو شد.", { reply_markup: REPLY_KB });
-    return;
-  }
 
   // مسیرها
-  if (text === KB.home) {
-    await send(env, chatId, "صفحهٔ اول.", { reply_markup: REPLY_KB });
-    return;
-  }
-  if (text === KB.help || text === "/help") {
-    await send(
+  if (text === KB.home) return send(env, chatId, "صفحهٔ اول.", { reply_markup: REPLY_KB });
+  if (text === KB.help || text === "/help")
+    return send(
       env,
       chatId,
-      "راهنما:\n• محصولات → سفارش با نام و آدرس\n• پیام به ادمین با Reply\n• ارسال شماره من\n• /menu برای نمایش منو\n• /cancel لغو سفارش جاری",
+      "راهنما:\n• محصولات → سفارش با Reply\n• پیام به ادمین با Reply\n• ارسال شماره من\n• /menu برای نمایش منو",
       { reply_markup: REPLY_KB }
     );
-    return;
-  }
-  if (text === KB.products) {
-    await showProducts(env, chatId);
-    return;
-  }
-  if (text === KB.account || text === "/whoami") {
-    await send(
+  if (text === KB.products) return showProducts(env, chatId);
+  if (text === KB.account || text === "/whoami")
+    return send(
       env,
       chatId,
       `👤 حساب شما:\nID: ${from.id}\nنام: ${(from.first_name || "") + " " + (from.last_name || "")}`.trim(),
       { reply_markup: REPLY_KB }
     );
-    return;
-  }
-  if (text === KB.ping || text === "/ping") {
-    await send(env, chatId, "pong 🏓", { reply_markup: REPLY_KB });
-    return;
-  }
-  if (text === KB.time || text === "/time") {
-    await send(env, chatId, `⏰ ${new Date().toISOString()}`, { reply_markup: REPLY_KB });
-    return;
-  }
-  if (text === KB.whoami) {
-    await send(env, chatId, `ID: ${from.id}`, { reply_markup: REPLY_KB });
-    return;
-  }
+  if (text === KB.ping || text === "/ping") return send(env, chatId, "pong 🏓", { reply_markup: REPLY_KB });
+  if (text === KB.time || text === "/time") return send(env, chatId, `⏰ ${new Date().toISOString()}`, { reply_markup: REPLY_KB });
+  if (text === KB.whoami) return send(env, chatId, `ID: ${from.id}`, { reply_markup: REPLY_KB });
 
   // پیام به ادمین: Reply روی پیام خاص
   if (text === KB.contact) {
@@ -266,9 +268,28 @@ async function handleMessage(update, env) {
     await send(env, chatId, "پیام‌تون برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
     return;
   }
+  if (repliedText && repliedText.includes("##ORDER:")) {
+    const m = repliedText.match(/##ORDER:(\d+)##/);
+    const pid = m?.[1] || "?";
+    const p = PRODUCTS[pid] ? `${PRODUCTS[pid].title} (${PRODUCTS[pid].price})` : `محصول ${pid}`;
+    await notifyAdmins(
+      env,
+      `🧾 سفارش جدید:\nمحصول: ${p}\n\nاز:\nID: ${from.id}\n` +
+        (from.username ? `@${from.username}\n` : "") +
+        `نام: ${(from.first_name || "") + " " + (from.last_name || "")}\n\n` +
+        `متن کاربر:\n${text}`
+    );
+    await send(env, chatId, "سفارش‌ت ثبت و برای ادمین ارسال شد ✅", { reply_markup: REPLY_KB });
+    return;
+  }
 
   // پیش‌فرض: اکو
   await send(env, chatId, `Echo: ${text}`, { reply_markup: REPLY_KB });
+}
+
+// Helper برای اجرای async بدون await (مثل ctx.waitUntil)
+function ctxWait(promise) {
+  promise?.catch?.(e => console.error("ctxWait error:", e));
 }
 
 async function handleUpdate(update, env) {
@@ -290,6 +311,31 @@ export default {
         headers: { "content-type": "application/json" },
       });
 
+    // CSV (با secret)
+    const exportSecret = env.ADMIN_EXPORT_SECRET || env.WH_SECRET;
+    if (request.method === "GET" && url.pathname === "/export/users.csv") {
+      if (!exportSecret || url.searchParams.get("secret") !== exportSecret)
+        return new Response("forbidden", { status: 403 });
+      const csv = await buildUsersCSV(env);
+      return new Response(csv, {
+        headers: {
+          "content-type": "text/csv; charset=utf-8",
+          "content-disposition": 'attachment; filename="users.csv"',
+        },
+      });
+    }
+    if (request.method === "GET" && url.pathname === "/export/phones.csv") {
+      if (!exportSecret || url.searchParams.get("secret") !== exportSecret)
+        return new Response("forbidden", { status: 403 });
+      const csv = await buildPhonesCSV(env);
+      return new Response(csv, {
+        headers: {
+          "content-type": "text/csv; charset=utf-8",
+          "content-disposition": 'attachment; filename="phones.csv"',
+        },
+      });
+    }
+
     // وبهوک تلگرام
     if (request.method === "POST" && url.pathname === `/webhook/${env.WH_SECRET}`) {
       const hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
@@ -297,22 +343,8 @@ export default {
         return new Response("forbidden", { status: 403 });
 
       let update = null; try { update = await request.json(); } catch {}
-      ctx.waitUntil(handleUpdate(update, env)); // پس‌زمینه
-      return new Response("ok");               // فوری
-    }
-
-    // آمار ساده (فقط برای ادمین — با query ?id=<admin_id>)
-    if (request.method === "GET" && url.pathname === "/stats") {
-      const id = Number(url.searchParams.get("id") || "0");
-      if (!ADMINS.includes(id)) return new Response("forbidden", { status: 403 });
-      const body = {
-        ok: true,
-        since: "since last deploy / hot start",
-        messages: MSG_COUNT,
-        orders: ORDER_COUNT,
-        active_conversations: ORDER_STATE.size,
-      };
-      return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+      ctx.waitUntil(handleUpdate(update, env));
+      return new Response("ok");
     }
 
     return new Response("not found", { status: 404 });
